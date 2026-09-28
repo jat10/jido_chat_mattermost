@@ -57,7 +57,7 @@ defmodule Jido.Chat.Mattermost.MixProject do
     [
       {:jido_chat, "~> 1.1"},
       {:req, "~> 0.5"},
-      {:fresh, "~> 0.4.4"},
+      {:fresh, github: "www-zaq-ai/fresh", branch: "main"},
       {:jason, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
