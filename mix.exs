@@ -57,7 +57,7 @@ defmodule Jido.Chat.Mattermost.MixProject do
     [
       {:jido_chat, "~> 1.1"},
       {:req, "~> 0.5"},
-      {:fresh, github: "agentjido/fresh", ref: "8cb7bd05478d3ddbd4fd1939ac202b3a3393fc33", override: true},
+      {:fresh, "~> 0.4.4"},
       {:jason, "~> 1.4"},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
