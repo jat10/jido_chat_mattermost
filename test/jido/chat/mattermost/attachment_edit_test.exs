@@ -535,8 +535,210 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     end
   end
 
+  defmodule SizedTransport do
+    def upload_files(_channel, files, _opts) do
+      send(self(), {:batch, files})
+
+      case Process.get(:upload_failure) do
+        nil -> {:ok, %{"file_infos" => Enum.map(files, &%{"id" => &1.filename, "name" => &1.filename})}}
+        failure -> {:error, failure}
+      end
+    end
+
+    def send_message(_channel, _text, opts) do
+      count = Process.get(:sized_post_count, 0) + 1
+      Process.put(:sized_post_count, count)
+      send(self(), {:posted, opts[:file_ids]})
+      send(self(), {:post_opts, opts})
+
+      if Process.get(:fail_post_number) == count do
+        {:error, :timeout}
+      else
+        {:ok, %{"id" => "post-#{count}", "file_ids" => opts[:file_ids]}}
+      end
+    end
+
+    def edit_message(_channel, id, _text, opts) do
+      send(self(), {:edited, opts[:file_ids]})
+      {:ok, %{"id" => id, "file_ids" => opts[:file_ids]}}
+    end
+  end
+
+  test "fifteen files return two confirmed posts through the SDK" do
+    files = for i <- 1..15, do: %FileUpload{data: :binary.copy("x", 1024), filename: "#{i}.txt"}
+    payload = Jido.Chat.Postable.text("All files", files: files)
+    thread = Jido.Chat.Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
+
+    assert {:ok, sent} = Jido.Chat.Thread.post(thread, payload, transport: SizedTransport, max_file_size: 307_200)
+
+    assert %{confirmation: :confirmed, messages: [first, second], failed_files: []} =
+             sent.response.metadata.delivery_report
+
+    assert first.message_id != second.message_id
+    assert length(first.metadata.file_ids) == 10
+    assert length(second.metadata.file_ids) == 5
+    assert first.body == "All files"
+    assert second.body == "Additional files (2/2)."
+    assert sent.id == first.message_id
+    assert_received {:batch, batch}
+    assert length(batch) == 10
+    assert_received {:batch, batch}
+    assert length(batch) == 5
+    refute_received {:batch, _}
+  end
+
+  test "nine valid files are posted and the oversized file is reported" do
+    files =
+      for i <- 1..10,
+          do: %FileUpload{data: :binary.copy("x", if(i == 6, do: 307_201, else: 1024)), filename: "#{i}.txt"}
+
+    assert {:ok, response} =
+             Adapter.post_message("room", Jido.Chat.PostPayload.new(%{files: files}),
+               transport: SizedTransport,
+               max_file_size: 307_200
+             )
+
+    assert %{confirmation: :partial, messages: [post], failed_files: [failure]} = response.metadata.delivery_report
+    assert length(post.metadata.file_ids) == 9
+    assert failure.filename == "6.txt"
+    assert failure.reason == :file_too_large
+    assert failure.size == 307_201
+    assert_received {:batch, batch}
+    assert length(batch) == 9
+  end
+
+  test "editing fifteen files updates the original and posts the remaining five in its thread" do
+    files = for i <- 1..15, do: %FileUpload{data: "x", filename: "#{i}.txt"}
+
+    assert {:ok, response} =
+             Adapter.edit_message("room", "existing", "answer",
+               files: files,
+               transport: SizedTransport,
+               max_file_size: 307_200
+             )
+
+    assert %{messages: [first, second], confirmation: :confirmed} = response.metadata.delivery_report
+    assert first.action == :updated
+    assert first.message_id == "existing"
+    assert second.action == :created
+    assert second.thread_id == "existing"
+    assert_received {:edited, first_ids}
+    assert length(first_ids) == 10
+    assert_received {:posted, next_ids}
+    assert length(next_ids) == 5
+    assert_received {:post_opts, options}
+    assert options[:thread_id] == "existing"
+  end
+
+  test "later failure returns confirmed messages and identifies unconfirmed and unattempted files" do
+    Process.put(:fail_post_number, 2)
+    files = for i <- 1..25, do: %FileUpload{data: "x", filename: "#{i}.txt"}
+
+    assert {:ok, response} =
+             Adapter.post_message("room", Jido.Chat.PostPayload.new(%{files: files}),
+               transport: SizedTransport,
+               max_file_size: 307_200
+             )
+
+    assert %{messages: [first], confirmation: :partial, failed_files: failures} = response.metadata.delivery_report
+    assert length(first.metadata.file_ids) == 10
+    assert Enum.count(failures, &(&1.reason == :timeout and &1.delivery == :unconfirmed)) == 10
+    assert Enum.count(failures, &(&1.reason == :not_attempted and &1.delivery == :not_sent)) == 5
+    assert Process.get(:sized_post_count) == 2
+  end
+
+  test "fifteen exact-limit files use fifteen upload requests and two posts" do
+    files = for i <- 1..15, do: %FileUpload{data: :binary.copy("x", 307_200), filename: "#{i}.txt"}
+
+    assert {:ok, response} =
+             Adapter.post_message("room", Jido.Chat.PostPayload.new(%{files: files}),
+               transport: SizedTransport,
+               max_file_size: 307_200,
+               thread_id: "root"
+             )
+
+    assert %{messages: [first, second], confirmation: :confirmed} = response.metadata.delivery_report
+    assert first.thread_id == "root"
+    assert second.thread_id == "root"
+    for _ <- 1..15, do: assert_received({:batch, [_]})
+    refute_received {:batch, _}
+    assert_received {:posted, first_ids}
+    assert length(first_ids) == 10
+    assert_received {:posted, last_ids}
+    assert length(last_ids) == 5
+  end
+
+  test "file delivery requires valid size configuration before any upload" do
+    upload = %FileUpload{data: "x", filename: "one.txt"}
+
+    for {value, reason} <- [
+          {nil, :missing_configuration},
+          {0, :invalid_configuration},
+          {-1, :invalid_configuration},
+          {"300", :invalid_configuration}
+        ] do
+      options = [max_file_size: value, transport: SizedTransport]
+      assert {:error, {^reason, :max_file_size}} = Adapter.send_file("room", upload, options)
+
+      assert {:error, {^reason, :max_file_size}} =
+               Adapter.edit_message("room", "post", "", Keyword.put(options, :files, [upload]))
+    end
+
+    refute_received {:batch, _}
+  end
+
+  test "upload requests respect encoded size while all IDs go to one post or edit" do
+    files = for i <- 1..10, do: %FileUpload{data: :binary.copy("x", 290 * 1024), filename: "#{i}.txt"}
+    payload = Jido.Chat.PostPayload.new(%{text: "files", files: files})
+    options = [transport: SizedTransport, max_file_size: 300 * 1024]
+
+    for mode <- [:post, :edit] do
+      result =
+        if mode == :post,
+          do: Adapter.post_message("room", payload, options),
+          else: Adapter.edit_message("room", "post", "files", Keyword.put(options, :files, files))
+
+      assert {:ok, response} = result
+      assert length(response.metadata.file_ids) == 10
+      for _ <- 1..10, do: assert_received({:batch, [_]})
+      refute_received {:batch, _}
+    end
+
+    assert_received {:posted, ids}
+    assert length(ids) == 10
+    assert_received {:edited, ^ids}
+  end
+
+  test "small files share a batch but oversized and unreadable files fail before upload" do
+    options = [transport: SizedTransport, max_file_size: 1024]
+    files = for i <- 1..10, do: %FileUpload{data: "x", filename: "#{i}.txt"}
+    assert {:ok, _} = Adapter.post_message("room", Jido.Chat.PostPayload.new(%{files: Enum.take(files, 2)}), options)
+    assert_received {:batch, [_, _]}
+    assert_received {:posted, _}
+    oversized = %FileUpload{data: :binary.copy("x", 1025), filename: "large.txt", size_bytes: 1}
+    assert {:error, {:file_too_large, %{size: 1025, limit: 1024}}} = Adapter.send_file("room", oversized, options)
+
+    assert {:error, {:file_read_error, :enoent}} =
+             Adapter.send_file("room", %FileUpload{path: "/nonexistent/limit-test.txt"}, options)
+
+    refute_received {:batch, _}
+    refute_received {:posted, _}
+  end
+
+  test "an exact-limit file fits with ordinary headers and failures never post" do
+    options = [transport: SizedTransport, max_file_size: 1024]
+    file = %FileUpload{data: :binary.copy("x", 1024), filename: "exact.txt"}
+    assert {:ok, _} = Adapter.send_file("room", file, options)
+    assert_received {:batch, [_]}
+    assert_received {:posted, _}
+    Process.put(:upload_failure, :timeout)
+    assert {:error, :timeout} = Adapter.send_file("room", file, options)
+    refute_received {:posted, _}
+  end
+
   defp opts do
     [
+      max_file_size: 307_200,
       transport: RecordingTransport,
       token: "test-token",
       files: [

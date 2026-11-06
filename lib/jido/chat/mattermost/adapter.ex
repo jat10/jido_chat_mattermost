@@ -26,6 +26,8 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
   use Jido.Chat.Adapter
 
+  require Logger
+
   alias Jido.Chat.Mattermost.{
     DeleteOptions,
     EditOptions,
@@ -197,6 +199,8 @@ defmodule Jido.Chat.Mattermost.Adapter do
     files = Jido.Chat.PostPayload.upload_candidates(payload)
     text = Jido.Chat.PostPayload.display_text(payload) || ""
 
+    Logger.info("Mattermost post_message: file_count=#{length(files)}")
+
     case files do
       [] ->
         send_message(channel_id, text, opts)
@@ -205,15 +209,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
         send_file(channel_id, file, if(text == "", do: opts, else: Keyword.put(opts, :caption, text)))
 
       _ ->
-        o = SendOptions.new(opts)
-        transport_opts = SendOptions.transport_opts(o)
-
-        with {:ok, metadata, ids} <- upload_files(channel_id, files, transport(o), transport_opts),
-             {:ok, post} <- transport(o).send_message(channel_id, text, Keyword.put(transport_opts, :file_ids, ids)),
-             :ok <- confirm_edited_files(post, ids) do
-          response = response_from_post(post, channel_id, :sent)
-          {:ok, %{response | metadata: edit_response_metadata(response.metadata, post, metadata, %{})}}
-        end
+        deliver_file_posts(channel_id, nil, text, files, opts)
     end
   end
 
@@ -229,6 +225,18 @@ defmodule Jido.Chat.Mattermost.Adapter do
   def edit_message(channel_id, post_id, text, opts \\ []) do
     o = EditOptions.new(opts)
 
+    Logger.info(
+      "Mattermost edit_message: file_count=#{length(o.files)}, max_file_size=#{inspect(o.max_file_size)} bytes"
+    )
+
+    if length(o.files) > 1 do
+      deliver_file_posts(channel_id, post_id, text, o.files, opts)
+    else
+      edit_one_message(channel_id, post_id, text, o)
+    end
+  end
+
+  defp edit_one_message(channel_id, post_id, text, o) do
     with {:ok, transport_opts, attachment_metadata} <- edit_file_opts(channel_id, o),
          {:ok, result} <- transport(o).edit_message(channel_id, post_id, text, transport_opts),
          :ok <- confirm_edited_files(result, transport_opts[:file_ids]) do
@@ -240,6 +248,150 @@ defmodule Jido.Chat.Mattermost.Adapter do
          | metadata: edit_response_metadata(response.metadata, result, attachment_metadata, o.previous_metadata)
        }}
     end
+  end
+
+  # Provider planning belongs here. The SDK retains the first message handle;
+  # metadata.delivery_report carries every confirmed post and rejected/pending file.
+  defp deliver_file_posts(channel_id, post_id, text, files, opts) do
+    limit = SendOptions.new(opts).max_file_size
+
+    with :ok <- validate_upload_limit(limit),
+         {:ok, valid, rejected} <- plan_files(channel_id, files, limit) do
+      parts = Enum.chunk_every(valid, 10)
+
+      Logger.info(
+        "Mattermost message plan: file_count=#{length(files)}, post_count=#{length(parts)}, rejected_file_count=#{length(rejected)}"
+      )
+
+      result =
+        parts
+        |> Enum.with_index()
+        |> Enum.reduce_while({[], []}, fn {part, index}, {delivered, _} ->
+          body = if index == 0, do: text, else: "Additional files (#{index + 1}/#{length(parts)})."
+          id = if index == 0, do: post_id
+          part_opts = continuation_opts(opts, delivered)
+
+          case deliver_file_post(channel_id, id, body, part, part_opts) do
+            {:ok, response} ->
+              message = %{
+                message_id: response.external_message_id,
+                body: body,
+                thread_id: SendOptions.new(part_opts).thread_id,
+                action: if(id, do: :updated, else: :created),
+                confirmation: :confirmed,
+                delivery_part_index: index,
+                metadata: response.metadata
+              }
+
+              Logger.info("Mattermost message part #{index + 1}/#{length(parts)} confirmed: file_count=#{length(part)}")
+              {:cont, {delivered ++ [{response, message}], []}}
+
+            {:error, reason} ->
+              Logger.warning(
+                "Mattermost message part #{index + 1}/#{length(parts)} failed; remaining parts will not be sent"
+              )
+
+              pending = pending_files(parts, index, reason)
+              {:halt, {delivered, pending}}
+          end
+        end)
+
+      file_post_result(result, rejected)
+    end
+  end
+
+  defp plan_files(channel_id, files, limit) do
+    files
+    |> FileUpload.normalize_many()
+    |> Enum.reduce_while({:ok, [], []}, fn file, {:ok, valid, rejected} ->
+      with {:ok, input} <- upload_input(file),
+           {:ok, size} <- upload_input_size(input),
+           :ok <- validate_file_size(input, size, limit),
+           {:ok, _} <- upload_batches(channel_id, [input], limit) do
+        {:cont, {:ok, valid ++ [file], rejected}}
+      else
+        {:error, {:file_too_large, details}} ->
+          failure = Map.merge(details, %{reason: :file_too_large, delivery: :not_sent})
+          {:cont, {:ok, valid, rejected ++ [failure]}}
+
+        error ->
+          {:halt, error}
+      end
+    end)
+    |> reject_empty_plan()
+  end
+
+  defp reject_empty_plan({:ok, [], [failure | _]}) do
+    {:error, {:file_too_large, Map.take(failure, [:filename, :size, :limit])}}
+  end
+
+  defp reject_empty_plan(result), do: result
+
+  defp continuation_opts(opts, []), do: opts
+
+  defp continuation_opts(opts, [{response, _} | _]) do
+    root = SendOptions.new(opts).thread_id || response.metadata[:root_id] || response.external_message_id
+    Keyword.put(opts, :thread_id, root)
+  end
+
+  defp deliver_file_post(channel_id, nil, text, files, opts) do
+    o = SendOptions.new(opts)
+    transport_opts = SendOptions.transport_opts(o)
+
+    with {:ok, metadata, ids} <- upload_files(channel_id, files, transport(o), transport_opts),
+         {:ok, post} <- transport(o).send_message(channel_id, text, Keyword.put(transport_opts, :file_ids, ids)),
+         :ok <- confirm_edited_files(post, ids),
+         :ok <- confirm_post_id(post) do
+      response = response_from_post(post, channel_id, :sent)
+      {:ok, %{response | metadata: edit_response_metadata(response.metadata, post, metadata, %{})}}
+    end
+  rescue
+    _ -> {:error, :transport_exception}
+  catch
+    :exit, _ -> {:error, :transport_exit}
+  end
+
+  defp deliver_file_post(channel_id, post_id, text, files, opts) do
+    edit_one_message(channel_id, post_id, text, EditOptions.new(Keyword.put(opts, :files, files)))
+  rescue
+    _ -> {:error, :transport_exception}
+  catch
+    :exit, _ -> {:error, :transport_exit}
+  end
+
+  defp confirm_post_id(post) do
+    case map_get(post, ["id", :id]) do
+      id when is_binary(id) and id != "" -> :ok
+      _ -> {:error, :unconfirmed_delivery}
+    end
+  end
+
+  defp pending_files(parts, index, reason) do
+    parts
+    |> Enum.drop(index)
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {files, offset} ->
+      Enum.map(files, fn file ->
+        %{
+          filename: file.filename,
+          reason: if(offset == 0, do: reason, else: :not_attempted),
+          delivery: if(offset == 0, do: :unconfirmed, else: :not_sent)
+        }
+      end)
+    end)
+  end
+
+  defp file_post_result({[], [failure | _]}, _rejected), do: {:error, failure.reason}
+  defp file_post_result({[{response, _}], []}, []), do: {:ok, response}
+
+  defp file_post_result({[{response, _} | _] = delivered, pending}, rejected) do
+    report = %{
+      confirmation: if(pending == [] and rejected == [], do: :confirmed, else: :partial),
+      messages: Enum.map(delivered, &elem(&1, 1)),
+      failed_files: rejected ++ pending
+    }
+
+    {:ok, %{response | metadata: Map.put(response.metadata, :delivery_report, report)}}
   end
 
   defp edit_file_opts(_channel_id, %EditOptions{files: []} = o),
@@ -674,22 +826,19 @@ defmodule Jido.Chat.Mattermost.Adapter do
   defp media_reference_url(_file_id), do: nil
 
   defp upload_files(channel_id, files, transport, opts) do
+    Logger.info("Mattermost upload: max_file_size=#{inspect(opts[:max_file_size])} bytes, file_count=#{length(files)}")
+
     uploads = FileUpload.normalize_many(files)
 
-    inputs =
-      uploads
-      |> Enum.reduce_while({:ok, []}, fn upload, {:ok, inputs} ->
-        case upload_input(upload) do
-          {:ok, input} -> {:cont, {:ok, [input | inputs]}}
-          error -> {:halt, error}
-        end
-      end)
-
-    with {:ok, inputs} <- inputs,
-         {:ok, result} <- transport.upload_files(channel_id, Enum.reverse(inputs), opts),
-         {:ok, ids} <- uploaded_file_ids_result(result),
+    with :ok <- validate_upload_limit(opts[:max_file_size]),
+         :ok <- validate_file_count(files),
+         {:ok, inputs} <- prepare_upload_inputs(uploads, opts[:max_file_size]),
+         {:ok, batches} <- upload_batches(channel_id, inputs, opts[:max_file_size]),
+         {:ok, infos} <- upload_batches(channel_id, batches, transport, opts),
+         {:ok, ids} <- uploaded_file_ids_result(%{"file_infos" => infos}),
          :ok <- confirm_batch_upload(ids, length(files)) do
-      # Batch file details come from the response, never from positional input pairing.
+      result = %{"file_infos" => infos}
+
       metadata =
         case uploads do
           [upload] -> upload_metadata(upload, result)
@@ -697,7 +846,95 @@ defmodule Jido.Chat.Mattermost.Adapter do
         end
 
       {:ok, metadata, ids}
+    else
+      error ->
+        Logger.warning("Mattermost upload stopped during validation or upload; post/update will not be sent")
+        error
     end
+  end
+
+  defp validate_upload_limit(nil), do: {:error, {:missing_configuration, :max_file_size}}
+  defp validate_upload_limit(limit) when is_integer(limit) and limit > 0, do: :ok
+  defp validate_upload_limit(_), do: {:error, {:invalid_configuration, :max_file_size}}
+
+  defp validate_file_count(files) when length(files) <= 10, do: :ok
+
+  defp validate_file_count(files) do
+    Logger.warning("Mattermost file count rejected: received=#{length(files)}, maximum_per_post=10")
+
+    {:error, {:too_many_files, 10}}
+  end
+
+  defp prepare_upload_inputs(uploads, limit) do
+    Enum.reduce_while(uploads, {:ok, []}, fn upload, {:ok, inputs} ->
+      with {:ok, input} <- upload_input(upload),
+           {:ok, size} <- upload_input_size(input),
+           :ok <- validate_file_size(input, size, limit) do
+        Logger.info("Mattermost file validated: size=#{size} bytes, max_file_size=#{limit} bytes")
+        {:cont, {:ok, inputs ++ [input]}}
+      else
+        error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp upload_input_size(%{body: body}), do: {:ok, byte_size(body)}
+
+  defp upload_input_size(%{path: path}) do
+    case File.stat(path) do
+      {:ok, %{type: :regular, size: size}} -> {:ok, size}
+      {:ok, _} -> {:error, :invalid_file_source}
+      {:error, reason} -> {:error, {:file_read_error, reason}}
+    end
+  end
+
+  defp validate_file_size(input, size, limit) do
+    if size <= limit,
+      do: :ok,
+      else: {:error, {:file_too_large, %{filename: input.filename, size: size, limit: limit}}}
+  end
+
+  defp upload_batches(channel_id, inputs, limit) do
+    # Mattermost v10's file API permits MaxFileSize + bytes.MinRead (512 bytes).
+    # Measure Req's actual multipart encoding, including filenames and MIME headers.
+    Enum.reduce_while(inputs, {:ok, []}, fn input, {:ok, batches} ->
+      if Jido.Chat.Mattermost.Transport.ReqClient.upload_size(channel_id, [input]) > limit + 512 do
+        {:halt, {:error, :upload_request_too_large}}
+      else
+        case List.pop_at(batches, -1) do
+          {nil, _} ->
+            {:cont, {:ok, [[input]]}}
+
+          {last, rest} ->
+            if Jido.Chat.Mattermost.Transport.ReqClient.upload_size(channel_id, last ++ [input]) <= limit + 512,
+              do: {:cont, {:ok, rest ++ [last ++ [input]]}},
+              else: {:cont, {:ok, batches ++ [[input]]}}
+        end
+      end
+    end)
+  end
+
+  defp upload_batches(channel_id, batches, transport, opts) do
+    Logger.info(
+      "Mattermost upload plan: http_request_count=#{length(batches)}, files_per_request=#{inspect(Enum.map(batches, &length/1))}; uploaded files target one post"
+    )
+
+    batches
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, []}, fn {batch, index}, {:ok, infos} ->
+      Logger.info("Mattermost upload request #{index}/#{length(batches)}: file_count=#{length(batch)}")
+
+      with {:ok, result} <- transport.upload_files(channel_id, batch, opts),
+           {:ok, ids} <- uploaded_file_ids_result(result),
+           :ok <- confirm_batch_upload(ids, length(batch)) do
+        Logger.info("Mattermost upload request #{index} confirmed: uploaded_file_count=#{length(ids)}")
+        {:cont, {:ok, infos ++ uploaded_file_infos(result)}}
+      else
+        error ->
+          Logger.warning("Mattermost upload request #{index} failed or returned unconfirmed file IDs")
+          {:halt, error}
+      end
+    end)
   end
 
   defp confirm_batch_upload(ids, count) do

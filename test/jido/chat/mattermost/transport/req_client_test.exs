@@ -13,7 +13,12 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
   alias Jido.Chat.Mattermost.Transport.ReqClient
   alias Jido.Chat.Mattermost.Adapter
 
-  defp opts, do: [url: @url, token: @token]
+  defp opts,
+    do: [
+      url: @url,
+      token: @token,
+      max_file_size: String.to_integer(System.get_env("MATTERMOST_MAX_FILE_SIZE", "307200"))
+    ]
 
   test "invalid authentication is preserved across writes, uploads, downloads, and typing" do
     post = create_post("authentication failure target")

@@ -36,6 +36,18 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
 
   def upload_files(_channel_id, _files, _opts), do: {:error, :missing_file_source}
 
+  @doc "Returns the encoded multipart byte count used to plan an upload request."
+  @spec upload_size(String.t(), [map()]) :: non_neg_integer()
+  def upload_size(channel_id, files) do
+    parts =
+      Enum.map(files, fn file ->
+        {:ok, part} = multipart_file(file)
+        {:files, part}
+      end)
+
+    Req.Utils.encode_form_multipart([{:channel_id, channel_id} | parts]).size
+  end
+
   defp multipart_file(%{path: path} = file) when is_binary(path) and path != "" do
     {:ok, {File.stream!(path, 2048), multipart_file_options(file, Map.get(file, :filename) || Path.basename(path))}}
   end

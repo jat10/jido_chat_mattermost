@@ -462,14 +462,42 @@ Use `Postable.text("Caption", files: uploads)` with `Thread.post/3` or
 `SentMessage.edit/3` to replace the attachments on the existing post.
 An empty upload list performs a text-only edit; it does not remove attachments.
 
-Files upload in one multipart `POST /api/v4/files` through `Transport.upload_files/3`,
-using one `files` part per input. All returned IDs are submitted together in one
-post or edit request only after the batch succeeds and confirms every file. An
-upload failure or incomplete response prevents the post/update; Mattermost may
-still have stored some files before returning a failure. Single-file uploads use
-the same `upload_files/3` callback with a one-item list. Custom transports must
-implement `upload_files/3`; the former `upload_file/3` callback has been removed.
-Server-configured size and attachment-count limits are enforced by Mattermost;
-HTTP failures propagate to the caller. Metadata contains ordered `file_ids`,
-`media`, and attachment snapshots for all files; singular metadata fields describe
-the first file for compatibility.
+File delivery requires `max_file_size` in bytes, supplied in per-call options or
+`config :jido_chat_mattermost, max_file_size: ...`. Set it to the server's
+`FileSettings.MaxFileSize`. Missing or invalid configuration returns
+`{:error, {:missing_configuration | :invalid_configuration, :max_file_size}}`
+before uploading; text-only sends and edits do not require this option.
+
+The adapter checks actual byte/file sizes before uploading and partitions valid
+files into posts of at most ten attachments. Oversized files are omitted and
+reported individually; an entirely rejected selection returns an error. Other
+invalid file sources fail preflight before any upload.
+
+For each post it measures Req's encoded multipart body, including headers, and
+groups files into requests fitting the configured limit plus Mattermost v10's
+512-byte multipart allowance. Large valid files can upload separately while their
+IDs are attached to the same post. `Transport.upload_files/3` remains one HTTP
+request per callback; custom transports must implement it.
+
+The first post contains the supplied text. Continuations contain
+`Additional files (2/2).` (with the actual indices) and reply under the first
+post, or under the existing thread root. For an attachment edit, the first part
+updates the existing message and subsequent parts become thread replies.
+
+The SDK still returns one `SentMessage`, bound to the first confirmed post. When
+multiple posts or rejected/pending files are involved, its response metadata has
+`delivery_report: %{confirmation: :confirmed | :partial, messages: [...],
+failed_files: [...]}`. Each confirmed message includes its `message_id`, `body`,
+`thread_id`, `action`, `confirmation`, `delivery_part_index`, and attachment
+`metadata`. Consumers must record these as separate messages. Ordinary successful
+single-post sends retain their existing response shape.
+
+A later upload/post failure stops delivery. The report preserves confirmed posts
+and marks files in the failed part as unconfirmed and later files as not attempted.
+A first-part failure returns an error. No automatic retries occur; orphaned uploads
+can remain stored after failures. Per-file rejections include filename, actual
+size, configured limit, and reason.
+
+Server configuration can change after preflight. HTTP failures still propagate.
+Metadata contains ordered `file_ids`, `media`, and attachment snapshots; singular
+metadata fields describe the first file for compatibility.

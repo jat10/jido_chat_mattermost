@@ -122,13 +122,13 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
     end
   end
 
-  defp fake_opts, do: [transport: FakeTransport]
+  defp fake_opts, do: [max_file_size: 307_200, transport: FakeTransport]
 
   describe "retained media validation and upload cases" do
     test "invalid media references fail before contacting the transport" do
       for reference <- [nil, 42, [], "ftp://example.com/file", "https://example.com"] do
         assert {:error, :invalid_media_reference} =
-                 MattermostAdapter.fetch_media(reference, transport: RecordingTransport)
+                 MattermostAdapter.fetch_media(reference, max_file_size: 307_200, transport: RecordingTransport)
 
         refute_received {:transport_call, _, _}
       end
@@ -140,7 +140,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
 
       for reference <- [%{url: url}, %{"url" => url}, Media.new(%{url: url})] do
         assert {:ok, "bytes"} =
-                 MattermostAdapter.fetch_media(reference, transport: RecordingTransport)
+                 MattermostAdapter.fetch_media(reference, max_file_size: 307_200, transport: RecordingTransport)
 
         assert_receive {:transport_call, :download_file, ["file_123", _]}
       end
@@ -183,7 +183,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
         Process.put({RecordingTransport, :upload_files}, {:ok, result})
 
         assert {:error, :missing_uploaded_file_id} =
-                 MattermostAdapter.send_file("c1", upload, transport: RecordingTransport)
+                 MattermostAdapter.send_file("c1", upload, max_file_size: 307_200, transport: RecordingTransport)
 
         assert_receive {:transport_call, :upload_files, ["c1", _, _]}
         refute_received {:transport_call, :send_message, _}
@@ -198,7 +198,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
         Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "p1"}})
 
         assert {:ok, response} =
-                 MattermostAdapter.send_file("c1", upload, transport: RecordingTransport)
+                 MattermostAdapter.send_file("c1", upload, max_file_size: 307_200, transport: RecordingTransport)
 
         assert response.metadata.delivered_kind == expected
         assert response.metadata.upload_kind == :file
@@ -211,6 +211,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
     setup do
       {:ok,
        opts: [
+         max_file_size: 307_200,
          transport: RecordingTransport,
          url: "https://chat.example.com",
          token: "test-token"
@@ -252,7 +253,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
         assert apply(MattermostAdapter, callback, args ++ [opts]) == expected
         assert_receive {:transport_call, ^transport_callback, forwarded}
         assert Enum.drop(forwarded, -1) == args
-        assert Map.new(List.last(forwarded)) == Map.new(Keyword.delete(opts, :transport))
+        assert Map.new(List.last(forwarded)) == Map.new(Keyword.drop(opts, [:transport, :max_file_size]))
       end
     end
 
