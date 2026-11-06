@@ -1,10 +1,11 @@
 defmodule Jido.Chat.Mattermost.EditOptions do
   @moduledoc "Options for editing a Mattermost post."
 
-  defstruct files: [], token: nil, transport: nil, url: nil
+  defstruct files: [], previous_metadata: %{}, token: nil, transport: nil, url: nil
 
   @type t :: %__MODULE__{
           files: [Jido.Chat.FileUpload.t()],
+          previous_metadata: map(),
           token: String.t() | nil,
           transport: module() | nil,
           url: String.t() | nil
@@ -15,6 +16,7 @@ defmodule Jido.Chat.Mattermost.EditOptions do
   def new(opts \\ []) do
     %__MODULE__{
       files: Keyword.get(opts, :files, []),
+      previous_metadata: Keyword.get(opts, :previous_metadata, %{}),
       token: opts[:token],
       transport: opts[:transport],
       url: opts[:url]

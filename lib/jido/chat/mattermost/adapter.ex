@@ -193,7 +193,9 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
   @doc """
   Edits a post, optionally attaching one prepared file through `files: [upload]`.
-  Text-only edits preserve attachments. File edits reuse the upload path and patch
+  Text-only edits reconcile attachments from the server response. When called through
+  `SentMessage`, `:previous_metadata` preserves omitted details for matching file IDs.
+  File edits reuse the upload path and update
   the existing post; upload/edit errors never fall back to creating another post.
   As with send_file, an upload can remain stored if the subsequent edit fails.
   """
@@ -201,27 +203,119 @@ defmodule Jido.Chat.Mattermost.Adapter do
   def edit_message(channel_id, post_id, text, opts \\ []) do
     o = EditOptions.new(opts)
 
-    with {:ok, transport_opts, media} <- edit_file_opts(channel_id, o),
+    with {:ok, transport_opts, attachment_metadata} <- edit_file_opts(channel_id, o),
          {:ok, result} <- transport(o).edit_message(channel_id, post_id, text, transport_opts),
          :ok <- confirm_edited_files(result, transport_opts[:file_ids]) do
       response = response_from_post(result, channel_id, :edited, post_id)
-      {:ok, %{response | metadata: Map.put(response.metadata, :media, media)}}
+
+      {:ok,
+       %{
+         response
+         | metadata: edit_response_metadata(response.metadata, result, attachment_metadata, o.previous_metadata)
+       }}
     end
   end
 
   defp edit_file_opts(_channel_id, %EditOptions{files: []} = o),
-    do: {:ok, EditOptions.transport_opts(o), []}
+    do: {:ok, EditOptions.transport_opts(o), nil}
 
   defp edit_file_opts(channel_id, %EditOptions{files: [file]} = o) do
     opts = EditOptions.transport_opts(o)
+    upload = FileUpload.normalize(file)
 
     with {:ok, upload_result, ids} <-
-           upload_file(channel_id, FileUpload.normalize(file), transport(o), opts) do
-      {:ok, Keyword.put(opts, :file_ids, ids), uploaded_media(upload_result)}
+           upload_file(channel_id, upload, transport(o), opts) do
+      {:ok, Keyword.put(opts, :file_ids, ids), upload_metadata(upload, upload_result)}
     end
   end
 
   defp edit_file_opts(_channel_id, _o), do: {:error, :multiple_attachments_unsupported}
+
+  defp edit_response_metadata(metadata, post, nil, previous) do
+    file_ids = map_get(post, ["file_ids", :file_ids])
+    files = post |> map_get(["metadata", :metadata]) |> map_get(["files", :files])
+
+    if is_list(file_ids) or is_list(files) do
+      Map.merge(metadata, post_file_metadata(files, file_ids, previous))
+    else
+      metadata
+    end
+  end
+
+  defp edit_response_metadata(metadata, _post, attachment_metadata, _previous),
+    do: Map.merge(metadata, attachment_metadata)
+
+  defp post_file_metadata(files, file_ids, previous) do
+    media = post_file_media(files, file_ids, previous)
+    first = List.first(media)
+    file_ids = Enum.map(media, & &1.metadata[:file_id]) |> Enum.reject(&is_nil/1)
+
+    first_id = List.first(file_ids)
+    first_info = Enum.find(List.wrap(files), &(map_get(&1, [:id, "id"]) == first_id))
+
+    previous_type =
+      if first_id != nil and first_id == map_get(previous, [:file_id, "file_id"]),
+        do: map_get(previous, [:content_type, "content_type"])
+
+    content_type =
+      get_non_blank(first_info || %{}, ["mime_type", :mime_type]) || previous_type || (first && first.media_type)
+
+    %{
+      media: media,
+      attachments: Enum.map(media, &Jido.Chat.Attachment.normalize/1),
+      file_id: List.first(file_ids),
+      file_ids: file_ids,
+      filename: first && first.filename,
+      size: first && first.size_bytes,
+      content_type: content_type,
+      delivered_kind: first && first.kind,
+      upload_kind: nil,
+      upload: nil
+    }
+  end
+
+  defp post_file_media(files, file_ids, previous) do
+    files = if is_list(files), do: Enum.filter(files, &is_map/1), else: []
+    known = previous |> map_get([:media, "media"]) |> List.wrap()
+
+    previous_by_id =
+      Map.new(known, fn media ->
+        id = media |> map_get([:metadata, "metadata"]) |> map_get([:file_id, "file_id"])
+
+        {id,
+         %{
+           "id" => id,
+           "name" => map_get(media, [:filename, "filename"]),
+           "mime_type" => map_get(media, [:media_type, "media_type"]),
+           "size" => map_get(media, [:size_bytes, "size_bytes"]),
+           "width" => map_get(media, [:width, "width"]),
+           "height" => map_get(media, [:height, "height"])
+         }}
+      end)
+
+    first_id = map_get(previous, [:file_id, "file_id"])
+
+    flat = %{
+      "name" => map_get(previous, [:filename, "filename"]),
+      "mime_type" => map_get(previous, [:content_type, "content_type"]),
+      "size" => map_get(previous, [:size, "size"])
+    }
+
+    previous_by_id =
+      Map.update(previous_by_id, first_id, flat, fn details ->
+        Map.merge(flat, Map.reject(details, fn {_key, value} -> is_nil(value) end))
+      end)
+
+    current_by_id = Map.new(files, &{map_get(&1, [:id, "id"]), &1})
+    ids = if is_list(file_ids), do: file_ids, else: Enum.map(files, &map_get(&1, [:id, "id"]))
+
+    Enum.map(ids, fn id ->
+      prior = if is_nil(id), do: %{}, else: Map.get(previous_by_id, id, %{})
+      current = Map.get(current_by_id, id, %{"id" => id})
+      current = Map.new(current, fn {key, value} -> {to_string(key), value} end)
+      normalize_file_media(Map.merge(prior, Map.reject(current, fn {_key, value} -> is_nil(value) end)))
+    end)
+  end
 
   defp confirm_edited_files(_result, nil), do: :ok
 
@@ -410,13 +504,16 @@ defmodule Jido.Chat.Mattermost.Adapter do
   defp default_thread_id(channel_id, external_thread_id),
     do: "mattermost:#{channel_id}:#{external_thread_id}"
 
-  defp extract_media(%{"files" => files}) when is_list(files) do
+  defp extract_media(%{"files" => files}) when is_list(files),
+    do: normalize_file_media_list(files)
+
+  defp extract_media(_), do: []
+
+  defp normalize_file_media_list(files) do
     files
     |> Enum.map(&normalize_file_media/1)
     |> Enum.reject(&is_nil/1)
   end
-
-  defp extract_media(_), do: []
 
   defp response_from_post(post, channel_id, status, fallback_post_id \\ nil) do
     Response.new(%{
@@ -623,16 +720,19 @@ defmodule Jido.Chat.Mattermost.Adapter do
   defp uploaded_file_infos(file_infos) when is_list(file_infos), do: file_infos
   defp uploaded_file_infos(_), do: []
 
-  defp uploaded_media(upload_result) do
+  defp uploaded_media(upload_result, upload) do
+    defaults = %{"name" => upload.filename, "mime_type" => upload.media_type, "size" => upload.size_bytes}
+
     upload_result
     |> uploaded_file_infos()
-    |> Enum.map(&normalize_file_media/1)
-    |> Enum.reject(&is_nil/1)
+    |> Enum.map(fn info ->
+      fields = Map.new(info, fn {key, value} -> {to_string(key), value} end)
+      Map.merge(defaults, Map.reject(fields, fn {_key, value} -> is_nil(value) end))
+    end)
+    |> normalize_file_media_list()
   end
 
   defp upload_response(%FileUpload{} = upload, upload_result, post_result, channel_id) do
-    file_info = upload_result |> uploaded_file_infos() |> List.first()
-
     Response.new(%{
       external_message_id: map_get(post_result, ["id", :id]),
       external_room_id: map_get(post_result, ["channel_id", :channel_id]) || channel_id,
@@ -641,21 +741,31 @@ defmodule Jido.Chat.Mattermost.Adapter do
       status: :sent,
       raw: post_result,
       metadata:
-        %{
-          media: uploaded_media(upload_result),
-          source_author_id: map_get(post_result, ["user_id", :user_id]),
-          file_id: map_get(file_info, ["id", :id]),
-          file_ids: uploaded_file_ids(upload_result),
-          filename: map_get(file_info, ["name", :name]) || upload.filename,
-          size: map_get(file_info, ["size", :size]) || upload.size_bytes,
-          content_type: map_get(file_info, ["mime_type", :mime_type]) || upload.media_type,
-          upload_kind: upload.kind,
-          delivered_kind: delivered_kind(upload, file_info),
-          upload: upload_result
-        }
+        upload_metadata(upload, upload_result)
+        |> Map.put(:source_author_id, map_get(post_result, ["user_id", :user_id]))
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new()
     })
+  end
+
+  defp upload_metadata(%FileUpload{} = upload, upload_result) do
+    file_info = upload_result |> uploaded_file_infos() |> List.first()
+
+    media = uploaded_media(upload_result, upload)
+
+    # Keep nil values so replacement edits clear details known only for the old file.
+    %{
+      media: media,
+      attachments: Enum.map(media, &Jido.Chat.Attachment.normalize/1),
+      file_id: map_get(file_info, ["id", :id]),
+      file_ids: uploaded_file_ids(upload_result),
+      filename: map_get(file_info, ["name", :name]) || upload.filename,
+      size: map_get(file_info, ["size", :size]) || upload.size_bytes,
+      content_type: map_get(file_info, ["mime_type", :mime_type]) || upload.media_type,
+      upload_kind: upload.kind,
+      delivered_kind: delivered_kind(upload, file_info),
+      upload: upload_result
+    }
   end
 
   defp delivered_kind(%FileUpload{} = upload, file_info) do

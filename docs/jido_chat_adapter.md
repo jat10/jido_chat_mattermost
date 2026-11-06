@@ -126,6 +126,7 @@ Capability key → callback mapping:
 | `:shutdown` | `shutdown` | 1 |
 | `:send_message` | `send_message` | 3 |
 | `:edit_message` | `edit_message` | 4 |
+| `:edit_attachments` | `edit_message` (accepts `files: [FileUpload.t()]`) | 4 |
 | `:delete_message` | `delete_message` | 3 |
 | `:start_typing` | `start_typing` | 2 |
 | `:fetch_metadata` | `fetch_metadata` | 2 |
@@ -442,3 +443,13 @@ adapter callbacks can return plain maps:
 
 Adapters should NOT construct these structs manually — just return the platform's
 raw map and let the SDK normalize it.
+
+### Attachment state after edits
+
+`SentMessage.edit/3` supplies the handle's metadata merged with its latest delivery
+response in `:previous_metadata`; response values take precedence.
+Mattermost uses it only to fill missing file details for matching file IDs;
+the returned file IDs still determine attachment membership and order.
+Text-only edit responses publish an explicit `metadata.attachments` list so the
+SDK refreshes its attachment list, including clearing it after external removal.
+An absent attachment snapshot leaves the SDK's existing fallback behavior intact.

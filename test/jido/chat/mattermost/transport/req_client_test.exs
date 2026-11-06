@@ -192,7 +192,9 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
   end
 
   @tag :tmp_dir
-  test "path-backed and byte-backed uploads attach to posts and download unchanged", %{tmp_dir: tmp_dir} do
+  test "path-backed and byte-backed uploads attach, replace on the same post, and download unchanged", %{
+    tmp_dir: tmp_dir
+  } do
     bytes = <<0, 1, 2, 127, 128, 254, 255>> <> "Mattermost binary attachment\n"
     path = Path.join(tmp_dir, "path-fixture.bin")
     File.write!(path, bytes)
@@ -211,6 +213,28 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
       assert {:ok, fetched} = ReqClient.fetch_post(post["id"], opts())
       assert fetched["file_ids"] == [info["id"]]
       assert {:ok, ^bytes} = ReqClient.download_file(info["id"], opts())
+
+      replacement_bytes = "replacement:" <> bytes
+      replacement = %{body: replacement_bytes, filename: "replacement.bin", content_type: "application/octet-stream"}
+      assert {:ok, %{"file_infos" => [replacement_info]}} = ReqClient.upload_file(@channel_id, replacement, opts())
+      replacement_id = replacement_info["id"]
+      refute replacement_id == info["id"]
+
+      assert {:ok, edited} =
+               ReqClient.edit_message(
+                 @channel_id,
+                 post["id"],
+                 "replaced attachment",
+                 Keyword.put(opts(), :file_ids, [replacement_id])
+               )
+
+      assert edited["id"] == post["id"]
+      assert edited["channel_id"] == @channel_id
+      assert edited["file_ids"] == [replacement_id]
+      assert {:ok, fetched} = ReqClient.fetch_post(post["id"], opts())
+      assert fetched["file_ids"] == [replacement_id]
+      # A successful edit response alone does not guarantee the file has a valid channel.
+      assert {:ok, ^replacement_bytes} = ReqClient.download_file(replacement_id, opts())
     end
   end
 
