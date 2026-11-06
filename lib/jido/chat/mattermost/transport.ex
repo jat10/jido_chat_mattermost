@@ -9,7 +9,7 @@ defmodule Jido.Chat.Mattermost.Transport do
   @callback send_message(channel_id :: String.t(), text :: String.t(), opts :: keyword()) ::
               {:ok, map()} | {:error, term()}
 
-  @callback upload_file(channel_id :: String.t(), file :: map(), opts :: keyword()) ::
+  @callback upload_files(channel_id :: String.t(), files :: [map()], opts :: keyword()) ::
               {:ok, map()} | {:error, term()}
 
   @callback download_file(file_id :: String.t(), opts :: keyword()) ::

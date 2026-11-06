@@ -27,7 +27,7 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientConfigTest do
   test "unusable upload sources fail without making a request" do
     for file <- [%{}, %{path: ""}, %{body: ""}, %{body: "bytes"}, %{body: "bytes", filename: ""}] do
       assert {:error, :missing_file_source} =
-               Jido.Chat.Mattermost.Transport.ReqClient.upload_file("c1", file, [])
+               Jido.Chat.Mattermost.Transport.ReqClient.upload_files("c1", [file], [])
     end
   end
 end

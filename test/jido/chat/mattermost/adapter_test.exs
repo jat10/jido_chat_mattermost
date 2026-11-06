@@ -27,8 +27,8 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
     end
 
     @impl true
-    def upload_file(channel_id, file, opts) do
-      send(self(), {:upload_file, channel_id, file, opts})
+    def upload_files(channel_id, [file], opts) do
+      send(self(), {:upload_files, channel_id, [file], opts})
 
       {:ok,
        %{
@@ -180,12 +180,12 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
       upload = FileUpload.new(%{kind: :file, data: "bytes", filename: "file.bin"})
 
       for result <- [%{}, %{"file_infos" => []}, %{"file_infos" => "invalid"}] do
-        Process.put({RecordingTransport, :upload_file}, {:ok, result})
+        Process.put({RecordingTransport, :upload_files}, {:ok, result})
 
         assert {:error, :missing_uploaded_file_id} =
                  MattermostAdapter.send_file("c1", upload, transport: RecordingTransport)
 
-        assert_receive {:transport_call, :upload_file, ["c1", _, _]}
+        assert_receive {:transport_call, :upload_files, ["c1", _, _]}
         refute_received {:transport_call, :send_message, _}
       end
     end
@@ -194,7 +194,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
       for {mime, expected} <- [{"image/png", :image}, {"audio/ogg", :audio}, {"video/mp4", :video}] do
         upload = FileUpload.new(%{kind: :file, data: "bytes", filename: "attachment.bin"})
         file = %{"id" => "f1", "mime_type" => mime}
-        Process.put({RecordingTransport, :upload_file}, {:ok, %{"file_infos" => [file]}})
+        Process.put({RecordingTransport, :upload_files}, {:ok, %{"file_infos" => [file]}})
         Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "p1"}})
 
         assert {:ok, response} =
@@ -707,7 +707,8 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
       assert caps.send_message == :native
       assert caps.send_file == :native
       assert caps.fetch_media == :native
-      assert caps.post_message == :fallback
+      assert caps.post_message == :native
+      assert caps.multi_file == :native
       assert caps.open_dm == :native
       assert caps.open_thread == :native
 
@@ -771,7 +772,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
 
         assert {:ok, response} = MattermostAdapter.send_file("c1", upload, fake_opts())
 
-        assert_received {:upload_file, "c1", file, _opts}
+        assert_received {:upload_files, "c1", [file], _opts}
         assert file.path == path
         assert file.filename == "path-upload.txt"
         assert file.content_type == "text/plain"
@@ -804,7 +805,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
                  Keyword.put(fake_opts(), :caption, "bytes")
                )
 
-      assert_received {:upload_file, "c1", file, _opts}
+      assert_received {:upload_files, "c1", [file], _opts}
       assert file.body == "mattermost bytes upload\n"
       assert file.filename == "bytes.txt"
 
@@ -836,7 +837,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
                )
     end
 
-    test "core post_message/4 uses canonical single-file fallback" do
+    test "core post_message/4 routes a single file through native posting" do
       payload =
         PostPayload.new(%{
           text: "canonical mattermost upload",
@@ -853,7 +854,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
       assert {:ok, response} =
                Adapter.post_message(MattermostAdapter, "c1", payload, fake_opts())
 
-      assert_received {:upload_file, "c1", file, _opts}
+      assert_received {:upload_files, "c1", [file], _opts}
       assert file.filename == "canonical.txt"
 
       assert_received {:send_message, "c1", "canonical mattermost upload", opts}

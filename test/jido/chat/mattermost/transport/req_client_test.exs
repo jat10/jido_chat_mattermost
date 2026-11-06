@@ -22,7 +22,8 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
     for {callback, args} <- [
           {:send_message, [@channel_id, "unauthorized"]},
           {:edit_message, [@channel_id, post["id"], "unauthorized"]},
-          {:upload_file, [@channel_id, %{body: "bytes", filename: "unauthorized.txt"}]},
+          {:upload_files, [@channel_id, [%{body: "bytes", filename: "unauthorized.txt"}]]},
+          {:upload_files, [@channel_id, [%{body: "one", filename: "one.txt"}, %{body: "two", filename: "two.txt"}]]},
           {:download_file, [@file_id]},
           {:add_reaction, [post["id"], "thumbsup"]},
           {:send_typing, [@channel_id]}
@@ -55,7 +56,8 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
           {:send_message, [@channel_id, "unreachable"]},
           {:edit_message, [@channel_id, "p1", "unreachable"]},
           {:delete_message, [@channel_id, "p1"]},
-          {:upload_file, [@channel_id, %{body: "bytes", filename: "unreachable.txt"}]},
+          {:upload_files, [@channel_id, [%{body: "bytes", filename: "unreachable.txt"}]]},
+          {:upload_files, [@channel_id, [%{body: "one", filename: "one.txt"}, %{body: "two", filename: "two.txt"}]]},
           {:download_file, [@file_id]}
         ] do
       assert {:error, %Req.TransportError{reason: :econnrefused}} =
@@ -203,7 +205,7 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
           {%{path: path}, "path-fixture.bin"},
           {%{body: bytes, filename: "bytes-fixture.bin", content_type: "application/octet-stream"}, "bytes-fixture.bin"}
         ] do
-      assert {:ok, uploaded} = ReqClient.upload_file(@channel_id, file, opts())
+      assert {:ok, uploaded} = ReqClient.upload_files(@channel_id, [file], opts())
       assert [info] = uploaded["file_infos"]
       assert info["name"] == expected_name
       assert info["size"] == byte_size(bytes)
@@ -216,7 +218,7 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
 
       replacement_bytes = "replacement:" <> bytes
       replacement = %{body: replacement_bytes, filename: "replacement.bin", content_type: "application/octet-stream"}
-      assert {:ok, %{"file_infos" => [replacement_info]}} = ReqClient.upload_file(@channel_id, replacement, opts())
+      assert {:ok, %{"file_infos" => [replacement_info]}} = ReqClient.upload_files(@channel_id, [replacement], opts())
       replacement_id = replacement_info["id"]
       refute replacement_id == info["id"]
 
@@ -235,6 +237,69 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
       assert fetched["file_ids"] == [replacement_id]
       # A successful edit response alone does not guarantee the file has a valid channel.
       assert {:ok, ^replacement_bytes} = ReqClient.download_file(replacement_id, opts())
+    end
+
+    for owner <- [Jido.Chat.Thread, Jido.Chat.ChannelRef] do
+      handle =
+        owner.new(%{
+          id: "integration",
+          adapter_name: :mattermost,
+          adapter: Adapter,
+          external_room_id: @channel_id,
+          external_id: @channel_id
+        })
+
+      files = [
+        %Jido.Chat.FileUpload{path: path},
+        %Jido.Chat.FileUpload{data: "second file", filename: "second.txt"}
+      ]
+
+      assert {:ok, sent} = owner.post(handle, Jido.Chat.Postable.text("Two files", files: files), opts())
+      on_exit(fn -> ReqClient.delete_message(@channel_id, sent.id, opts()) end)
+      assert length(sent.response.metadata.file_ids) == 2
+      assert {:ok, post} = ReqClient.fetch_post(sent.id, opts())
+      assert post["file_ids"] == sent.response.metadata.file_ids
+
+      expected_files = %{"path-fixture.bin" => bytes, "second.txt" => "second file"}
+
+      for media <- sent.response.metadata.media do
+        expected = Map.fetch!(expected_files, media.filename)
+        assert {:ok, ^expected} = Adapter.fetch_media(media, opts())
+      end
+
+      replacements = [
+        %Jido.Chat.FileUpload{data: "new first", filename: "new-first.txt"},
+        %Jido.Chat.FileUpload{data: <<0, 255, 128>>, filename: "new-second.bin"}
+      ]
+
+      restored =
+        sent |> Jido.Chat.SentMessage.to_map() |> Map.put("default_opts", []) |> Jido.Chat.SentMessage.from_map()
+
+      assert {:ok, edited} =
+               Jido.Chat.SentMessage.edit(
+                 restored,
+                 Jido.Chat.Postable.text("Two replacements", files: replacements),
+                 opts()
+               )
+
+      assert edited.id == sent.id
+      assert length(edited.attachments) == 2
+      assert {:ok, post} = ReqClient.fetch_post(sent.id, opts())
+      assert post["file_ids"] == edited.metadata.file_ids
+      refute Enum.any?(post["file_ids"], &(&1 in sent.response.metadata.file_ids))
+
+      expected_files = %{"new-first.txt" => "new first", "new-second.bin" => <<0, 255, 128>>}
+
+      for media <- edited.metadata.media do
+        expected = Map.fetch!(expected_files, media.filename)
+        assert {:ok, ^expected} = Adapter.fetch_media(media, opts())
+      end
+
+      assert {:ok, _} = edited |> Jido.Chat.SentMessage.to_map() |> Jason.encode()
+      assert {:ok, text_edited} = Jido.Chat.SentMessage.edit(edited, "Text only", opts())
+      assert MapSet.new(text_edited.metadata.file_ids) == MapSet.new(edited.metadata.file_ids)
+      assert text_edited.metadata.file_ids == text_edited.response.raw["file_ids"]
+      assert MapSet.new(text_edited.attachments, & &1.filename) == MapSet.new(["new-first.txt", "new-second.bin"])
     end
   end
 
@@ -260,7 +325,7 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
           :bytes -> %{body: bytes, filename: filename, content_type: media_type}
         end
 
-      assert {:ok, %{"file_infos" => [info]}} = ReqClient.upload_file(@channel_id, file, opts())
+      assert {:ok, %{"file_infos" => [info]}} = ReqClient.upload_files(@channel_id, [file], opts())
       assert info["name"] == filename
       assert info["mime_type"] == file_info_media_type
       assert info["size"] == byte_size(bytes)

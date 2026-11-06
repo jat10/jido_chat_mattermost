@@ -6,7 +6,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
   alias Jido.Chat.Mattermost.Test.RecordingTransport
 
   setup do
-    Process.put({RecordingTransport, :upload_file}, {:ok, %{"file_infos" => [%{"id" => "file"}]}})
+    Process.put({RecordingTransport, :upload_files}, {:ok, %{"file_infos" => [%{"id" => "file"}]}})
 
     Process.put(
       {RecordingTransport, :edit_message},
@@ -41,7 +41,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert {:ok, _} = edited |> Jido.Chat.SentMessage.to_map() |> Jason.encode()
     assert [media] = edited.metadata.media
     assert media.metadata.file_id == "file"
-    assert_received {:transport_call, :upload_file, ["room", upload, upload_opts]}
+    assert_received {:transport_call, :upload_files, ["room", [upload], upload_opts]}
     assert upload == %{body: <<0, 255>>, filename: "file.png", content_type: "image/png"}
     assert upload_opts[:token] == "test-token"
     assert_received {:transport_call, :edit_message, ["room", "post", "Answer", edit_opts]}
@@ -58,7 +58,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert media.filename == "file.png"
     assert_received {:transport_call, :edit_message, ["room", "post", "Revised answer", text_opts]}
     refute Keyword.has_key?(text_opts, :file_ids)
-    refute_received {:transport_call, :upload_file, _}
+    refute_received {:transport_call, :upload_files, _}
   end
 
   test "replacing an attachment updates the file reference used by fetch_media" do
@@ -67,7 +67,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     original_upload = %FileUpload{data: "old", filename: "old.txt", media_type: "text/plain", size_bytes: 3}
 
     Process.put(
-      {RecordingTransport, :upload_file},
+      {RecordingTransport, :upload_files},
       {:ok, %{"file_infos" => [%{"id" => "old", "name" => "old.txt", "mime_type" => "text/plain"}]}}
     )
 
@@ -87,11 +87,11 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
 
     assert sent.metadata.file_id == "old"
     assert sent.metadata.size == 3
-    assert_received {:transport_call, :upload_file, _}
+    assert_received {:transport_call, :upload_files, _}
     assert_received {:transport_call, :send_message, _}
 
     Process.put(
-      {RecordingTransport, :upload_file},
+      {RecordingTransport, :upload_files},
       {:ok, %{"file_infos" => [%{"id" => "file", "name" => "file.png", "mime_type" => "image/png"}]}}
     )
 
@@ -133,7 +133,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert {:ok, first} = Jido.Chat.SentMessage.edit(sent, payload, transport_opts)
     restored = first |> Jido.Chat.SentMessage.to_map() |> Jido.Chat.SentMessage.from_map()
 
-    Process.put({RecordingTransport, :upload_file}, {:ok, %{"file_infos" => [%{"id" => "replacement"}]}})
+    Process.put({RecordingTransport, :upload_files}, {:ok, %{"file_infos" => [%{"id" => "replacement"}]}})
     Process.put({RecordingTransport, :edit_message}, {:ok, %{"id" => "post", "file_ids" => ["replacement"]}})
 
     assert {:ok, edited} = Jido.Chat.SentMessage.edit(restored, payload, transport_opts)
@@ -149,9 +149,9 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
           {{:error, :timeout}, :timeout},
           {{:ok, %{"file_infos" => []}}, :missing_uploaded_file_id}
         ] do
-      Process.put({RecordingTransport, :upload_file}, result)
+      Process.put({RecordingTransport, :upload_files}, result)
       assert {:error, ^error} = Adapter.edit_message("room", "post", "Answer", opts())
-      assert_received {:transport_call, :upload_file, _}
+      assert_received {:transport_call, :upload_files, _}
       refute_received {:transport_call, :edit_message, _}
       refute_received {:transport_call, :send_message, _}
     end
@@ -160,7 +160,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
   test "edit failure never retries an upload or creates another post" do
     Process.put({RecordingTransport, :edit_message}, {:error, :timeout})
     assert {:error, :timeout} = Adapter.edit_message("room", "post", "Answer", opts())
-    assert_received {:transport_call, :upload_file, _}
+    assert_received {:transport_call, :upload_files, _}
     assert_received {:transport_call, :edit_message, _}
     refute_received {:transport_call, _, _}
   end
@@ -197,7 +197,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
 
     assert_received {:transport_call, :edit_message, ["room", "post", "Updated answer", edit_opts]}
     refute Keyword.has_key?(edit_opts, :file_ids)
-    refute_received {:transport_call, :upload_file, _}
+    refute_received {:transport_call, :upload_files, _}
 
     assert [media] = response.metadata.media
     assert media.metadata.file_id == "existing"
@@ -206,7 +206,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert media.media_type == "image/png"
     assert media.size_bytes == 42
 
-    Process.put({RecordingTransport, :upload_file}, {:ok, %{"file_infos" => post["metadata"]["files"]}})
+    Process.put({RecordingTransport, :upload_files}, {:ok, %{"file_infos" => post["metadata"]["files"]}})
     Process.put({RecordingTransport, :send_message}, {:ok, post})
     Process.put({RecordingTransport, :edit_message}, {:ok, %{"id" => "post", "file_ids" => ["existing"]}})
     transport_opts = Keyword.delete(opts(), :files)
@@ -280,7 +280,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert media.metadata.file_id == "remote"
     assert_received {:transport_call, :edit_message, ["room", "post", "Updated text", forwarded]}
     refute Keyword.has_key?(forwarded, :file_ids)
-    refute_received {:transport_call, :upload_file, _}
+    refute_received {:transport_call, :upload_files, _}
     refute_received {:transport_call, :send_message, _}
 
     Process.put({RecordingTransport, :download_file}, {:ok, "new PDF bytes"})
@@ -321,7 +321,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
       assert edited.metadata.upload == nil
       assert {:error, :invalid_media_reference} = Adapter.fetch_media(edited.metadata, opts())
       refute_received {:transport_call, :download_file, _}
-      refute_received {:transport_call, :upload_file, _}
+      refute_received {:transport_call, :upload_files, _}
     end
   end
 
@@ -365,7 +365,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert edited.response.raw["file_ids"] == ["one", "two"]
     assert_received {:transport_call, :edit_message, ["room", "post", "Updated text", forwarded]}
     refute Keyword.has_key?(forwarded, :file_ids)
-    refute_received {:transport_call, :upload_file, _}
+    refute_received {:transport_call, :upload_files, _}
     refute_received {:transport_call, :send_message, _}
 
     assert edited.metadata.file_ids == ["one", "two"]
@@ -414,12 +414,12 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
       assert Enum.map(edited.metadata.media, & &1.metadata[:file_id]) == ids
       assert edited.metadata.filename == nil
       assert Jido.Chat.SentMessage.to_map(edited)["metadata"]["file_ids"] == ids
-      refute_received {:transport_call, :upload_file, _}
+      refute_received {:transport_call, :upload_files, _}
       refute_received {:transport_call, :send_message, _}
     end
   end
 
-  test "text-only edits omit file IDs and multiple files fail before uploading" do
+  test "text-only edits omit file IDs" do
     Process.put({RecordingTransport, :edit_message}, {:ok, %{"id" => "post"}})
 
     assert {:ok, response} =
@@ -428,19 +428,111 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     refute Map.has_key?(response.metadata, :media)
     assert_received {:transport_call, :edit_message, ["room", "post", "Answer", edit_opts]}
     refute Keyword.has_key?(edit_opts, :file_ids)
-    refute_received {:transport_call, :upload_file, _}
+    refute_received {:transport_call, :upload_files, _}
+  end
 
-    [file] = opts()[:files]
+  test "multiple uploads produce one post or edit with server-ordered attachment metadata" do
+    for operation <- [:post, :edit] do
+      Process.put(
+        {RecordingTransport, :upload_files},
+        {:ok, %{"file_infos" => [%{"id" => "one", "name" => "one.bin"}, %{"id" => "two", "name" => "two.txt"}]}}
+      )
 
-    assert {:error, :multiple_attachments_unsupported} =
-             Adapter.edit_message(
-               "room",
-               "post",
-               "Answer",
-               Keyword.put(opts(), :files, [file, file])
-             )
+      result = {:ok, %{"id" => "post", "channel_id" => "room", "file_ids" => ["two", "one"]}}
+      Process.put({RecordingTransport, :send_message}, result)
+      Process.put({RecordingTransport, :edit_message}, result)
+      assert {:ok, response} = multi_operation(operation)
+      assert response.metadata.file_ids == ["two", "one"]
+      assert Enum.map(response.metadata.media, & &1.metadata.file_id) == ["two", "one"]
+      assert Enum.map(response.metadata.attachments, & &1.filename) == ["two.txt", "one.bin"]
+      assert {:ok, _} = response.metadata |> Jido.Chat.Wire.to_plain() |> Jason.encode()
+      assert_received {:transport_call, :upload_files, ["room", [%{body: <<0, 255>>}, %{body: "two"}], _]}
+
+      case operation do
+        :post ->
+          assert_received {:transport_call, :send_message, ["room", "Files", forwarded]}
+          assert forwarded[:file_ids] == ["one", "two"]
+          assert forwarded[:thread_id] == "root"
+
+        :edit ->
+          assert_received {:transport_call, :edit_message, ["room", "post", "Files", forwarded]}
+          assert forwarded[:file_ids] == ["one", "two"]
+      end
+
+      refute_received {:transport_call, _, _}
+    end
+  end
+
+  test "failed or incomplete batch uploads prevent posting a partial attachment set" do
+    for operation <- [:post, :edit],
+        {result, reason} <- [
+          {{:error, {413, "too large"}}, {413, "too large"}},
+          {{:error, :timeout}, :timeout},
+          {{:ok, %{"file_infos" => []}}, :missing_uploaded_file_id},
+          {{:ok, %{"file_infos" => [%{"id" => "one"}]}}, :unconfirmed_upload},
+          {{:ok, %{"file_infos" => [%{"id" => "one"}, %{"id" => "one"}]}}, :unconfirmed_upload},
+          {{:ok, %{"file_infos" => [%{"id" => "one"}, %{"name" => "missing-id"}]}}, :unconfirmed_upload}
+        ] do
+      Process.put({RecordingTransport, :upload_files}, result)
+      assert {:error, ^reason} = multi_operation(operation)
+      assert_received {:transport_call, :upload_files, _}
+      refute_received {:transport_call, _, _}
+    end
+  end
+
+  test "multiple-file delivery must confirm every uploaded ID" do
+    for operation <- [:post, :edit] do
+      Process.put({RecordingTransport, :upload_files}, {:ok, %{"file_infos" => [%{"id" => "one"}, %{"id" => "two"}]}})
+
+      Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "post", "file_ids" => ["one"]}})
+      Process.put({RecordingTransport, :edit_message}, {:ok, %{"id" => "post", "file_ids" => ["one"]}})
+      assert {:error, :unconfirmed_delivery} = multi_operation(operation)
+      assert_received {:transport_call, :upload_files, _}
+      callback = if operation == :post, do: :send_message, else: :edit_message
+      assert_received {:transport_call, ^callback, _}
+      refute_received {:transport_call, _, _}
+    end
+  end
+
+  test "an invalid later file is rejected before any upload" do
+    [valid] = opts()[:files]
+    files = [valid, %FileUpload{filename: "missing.txt"}]
+    payload = Jido.Chat.PostPayload.new(%{text: "Files", files: files})
+    assert {:error, :missing_file_source} = Adapter.post_message("room", payload, opts())
+
+    assert {:error, :missing_file_source} =
+             Adapter.edit_message("room", "post", "Files", Keyword.put(opts(), :files, files))
 
     refute_received {:transport_call, _, _}
+  end
+
+  defp multi_operation(operation) do
+    payload =
+      Jido.Chat.Postable.text("Files",
+        files: [
+          %FileUpload{data: <<0, 255>>, filename: "one.bin"},
+          %FileUpload{data: "two", filename: "two.txt"}
+        ]
+      )
+
+    options = opts() |> Keyword.delete(:files) |> Keyword.put(:thread_id, "root")
+
+    case operation do
+      :post ->
+        Jido.Chat.Adapter.post_message(Adapter, "room", Jido.Chat.Postable.to_payload(payload), options)
+
+      :edit ->
+        sent =
+          Jido.Chat.SentMessage.new(%{
+            adapter: Adapter,
+            response: %{external_message_id: "post", external_room_id: "room"}
+          })
+
+        case Jido.Chat.SentMessage.edit(sent, payload, options) do
+          {:ok, edited} -> {:ok, edited.response}
+          error -> error
+        end
+    end
   end
 
   defp opts do

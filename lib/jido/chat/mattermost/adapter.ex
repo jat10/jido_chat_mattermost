@@ -52,7 +52,8 @@ defmodule Jido.Chat.Mattermost.Adapter do
       shutdown: :fallback,
       send_message: :native,
       send_file: :native,
-      post_message: :fallback,
+      post_message: :native,
+      multi_file: :native,
       edit_message: :native,
       edit_attachments: :native,
       delete_message: :native,
@@ -179,20 +180,45 @@ defmodule Jido.Chat.Mattermost.Adapter do
     o = SendOptions.new(opts)
     transport_opts = SendOptions.transport_opts(o)
 
-    with {:ok, upload_result, file_ids} <-
-           upload_file(channel_id, upload, transport(o), transport_opts),
+    with {:ok, metadata, file_ids} <-
+           upload_files(channel_id, [upload], transport(o), transport_opts),
          {:ok, post_result} <-
            transport(o).send_message(
              channel_id,
              upload_caption(upload, opts),
              Keyword.put(transport_opts, :file_ids, file_ids)
            ) do
-      {:ok, upload_response(upload, upload_result, post_result, channel_id)}
+      {:ok, upload_response(metadata, post_result, channel_id)}
+    end
+  end
+
+  @impl true
+  def post_message(channel_id, payload, opts \\ []) do
+    files = Jido.Chat.PostPayload.upload_candidates(payload)
+    text = Jido.Chat.PostPayload.display_text(payload) || ""
+
+    case files do
+      [] ->
+        send_message(channel_id, text, opts)
+
+      [file] ->
+        send_file(channel_id, file, if(text == "", do: opts, else: Keyword.put(opts, :caption, text)))
+
+      _ ->
+        o = SendOptions.new(opts)
+        transport_opts = SendOptions.transport_opts(o)
+
+        with {:ok, metadata, ids} <- upload_files(channel_id, files, transport(o), transport_opts),
+             {:ok, post} <- transport(o).send_message(channel_id, text, Keyword.put(transport_opts, :file_ids, ids)),
+             :ok <- confirm_edited_files(post, ids) do
+          response = response_from_post(post, channel_id, :sent)
+          {:ok, %{response | metadata: edit_response_metadata(response.metadata, post, metadata, %{})}}
+        end
     end
   end
 
   @doc """
-  Edits a post, optionally attaching one prepared file through `files: [upload]`.
+  Edits a post, optionally replacing its attachments through `files: uploads`.
   Text-only edits reconcile attachments from the server response. When called through
   `SentMessage`, `:previous_metadata` preserves omitted details for matching file IDs.
   File edits reuse the upload path and update
@@ -219,17 +245,13 @@ defmodule Jido.Chat.Mattermost.Adapter do
   defp edit_file_opts(_channel_id, %EditOptions{files: []} = o),
     do: {:ok, EditOptions.transport_opts(o), nil}
 
-  defp edit_file_opts(channel_id, %EditOptions{files: [file]} = o) do
+  defp edit_file_opts(channel_id, %EditOptions{files: files} = o) when is_list(files) do
     opts = EditOptions.transport_opts(o)
-    upload = FileUpload.normalize(file)
 
-    with {:ok, upload_result, ids} <-
-           upload_file(channel_id, upload, transport(o), opts) do
-      {:ok, Keyword.put(opts, :file_ids, ids), upload_metadata(upload, upload_result)}
+    with {:ok, metadata, ids} <- upload_files(channel_id, files, transport(o), opts) do
+      {:ok, Keyword.put(opts, :file_ids, ids), metadata}
     end
   end
-
-  defp edit_file_opts(_channel_id, _o), do: {:error, :multiple_attachments_unsupported}
 
   defp edit_response_metadata(metadata, post, nil, previous) do
     file_ids = map_get(post, ["file_ids", :file_ids])
@@ -242,8 +264,14 @@ defmodule Jido.Chat.Mattermost.Adapter do
     end
   end
 
-  defp edit_response_metadata(metadata, _post, attachment_metadata, _previous),
-    do: Map.merge(metadata, attachment_metadata)
+  defp edit_response_metadata(metadata, post, attachment_metadata, _previous) do
+    reconciled = edit_response_metadata(metadata, post, nil, attachment_metadata)
+
+    attachment_metadata
+    |> Map.merge(reconciled)
+    |> Map.put(:upload, attachment_metadata.upload)
+    |> Map.put(:upload_kind, attachment_metadata.upload_kind)
+  end
 
   defp post_file_metadata(files, file_ids, previous) do
     media = post_file_media(files, file_ids, previous)
@@ -645,12 +673,38 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
   defp media_reference_url(_file_id), do: nil
 
-  defp upload_file(channel_id, upload, transport, opts) do
-    with {:ok, input} <- upload_input(upload),
-         {:ok, result} <- transport.upload_file(channel_id, input, opts),
-         {:ok, ids} <- uploaded_file_ids_result(result) do
-      {:ok, result, ids}
+  defp upload_files(channel_id, files, transport, opts) do
+    uploads = FileUpload.normalize_many(files)
+
+    inputs =
+      uploads
+      |> Enum.reduce_while({:ok, []}, fn upload, {:ok, inputs} ->
+        case upload_input(upload) do
+          {:ok, input} -> {:cont, {:ok, [input | inputs]}}
+          error -> {:halt, error}
+        end
+      end)
+
+    with {:ok, inputs} <- inputs,
+         {:ok, result} <- transport.upload_files(channel_id, Enum.reverse(inputs), opts),
+         {:ok, ids} <- uploaded_file_ids_result(result),
+         :ok <- confirm_batch_upload(ids, length(files)) do
+      # Batch file details come from the response, never from positional input pairing.
+      metadata =
+        case uploads do
+          [upload] -> upload_metadata(upload, result)
+          _ -> upload_metadata(%FileUpload{}, result) |> Map.put(:upload_kind, nil)
+        end
+
+      {:ok, metadata, ids}
     end
+  end
+
+  defp confirm_batch_upload(ids, count) do
+    if length(ids) == count and length(Enum.uniq(ids)) == count and
+         Enum.all?(ids, &(is_binary(&1) and &1 != "")),
+       do: :ok,
+       else: {:error, :unconfirmed_upload}
   end
 
   defp upload_input(%FileUpload{path: path} = upload) when is_binary(path) and path != "" do
@@ -732,7 +786,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
     |> normalize_file_media_list()
   end
 
-  defp upload_response(%FileUpload{} = upload, upload_result, post_result, channel_id) do
+  defp upload_response(metadata, post_result, channel_id) do
     Response.new(%{
       external_message_id: map_get(post_result, ["id", :id]),
       external_room_id: map_get(post_result, ["channel_id", :channel_id]) || channel_id,
@@ -741,7 +795,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
       status: :sent,
       raw: post_result,
       metadata:
-        upload_metadata(upload, upload_result)
+        metadata
         |> Map.put(:source_author_id, map_get(post_result, ["user_id", :user_id]))
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new()

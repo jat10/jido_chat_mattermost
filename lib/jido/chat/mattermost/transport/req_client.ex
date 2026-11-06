@@ -20,22 +20,32 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
   end
 
   @impl true
-  def upload_file(channel_id, %{path: path} = file, opts)
-      when is_binary(path) and path != "" do
-    file_part =
-      {File.stream!(path, 2048), multipart_file_options(file, Map.get(file, :filename) || Path.basename(path))}
+  def upload_files(channel_id, [_ | _] = files, opts) do
+    parts =
+      Enum.reduce_while(files, {:ok, []}, fn file, {:ok, parts} ->
+        case multipart_file(file) do
+          {:ok, part} -> {:cont, {:ok, [{:files, part} | parts]}}
+          error -> {:halt, error}
+        end
+      end)
 
-    post_multipart("/api/v4/files", [channel_id: channel_id, files: file_part], opts)
+    with {:ok, parts} <- parts do
+      post_multipart("/api/v4/files", [{:channel_id, channel_id} | Enum.reverse(parts)], opts)
+    end
   end
 
-  def upload_file(channel_id, %{body: body, filename: filename} = file, opts)
-      when is_binary(body) and body != "" and is_binary(filename) and filename != "" do
-    file_part = {body, multipart_file_options(file, filename)}
+  def upload_files(_channel_id, _files, _opts), do: {:error, :missing_file_source}
 
-    post_multipart("/api/v4/files", [channel_id: channel_id, files: file_part], opts)
+  defp multipart_file(%{path: path} = file) when is_binary(path) and path != "" do
+    {:ok, {File.stream!(path, 2048), multipart_file_options(file, Map.get(file, :filename) || Path.basename(path))}}
   end
 
-  def upload_file(_channel_id, _file, _opts), do: {:error, :missing_file_source}
+  defp multipart_file(%{body: body, filename: filename} = file)
+       when is_binary(body) and body != "" and is_binary(filename) and filename != "" do
+    {:ok, {body, multipart_file_options(file, filename)}}
+  end
+
+  defp multipart_file(_file), do: {:error, :missing_file_source}
 
   @impl true
   def download_file(file_id, opts) do

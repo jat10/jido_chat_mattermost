@@ -453,3 +453,23 @@ the returned file IDs still determine attachment membership and order.
 Text-only edit responses publish an explicit `metadata.attachments` list so the
 SDK refreshes its attachment list, including clearing it after external removal.
 An absent attachment snapshot leaves the SDK's existing fallback behavior intact.
+
+### Multiple-file posts and edits
+
+The adapter declares `post_message: :native` and `multi_file: :native`.
+Use `Postable.text("Caption", files: uploads)` with `Thread.post/3` or
+`ChannelRef.post/3` to attach multiple files to one post, or with
+`SentMessage.edit/3` to replace the attachments on the existing post.
+An empty upload list performs a text-only edit; it does not remove attachments.
+
+Files upload in one multipart `POST /api/v4/files` through `Transport.upload_files/3`,
+using one `files` part per input. All returned IDs are submitted together in one
+post or edit request only after the batch succeeds and confirms every file. An
+upload failure or incomplete response prevents the post/update; Mattermost may
+still have stored some files before returning a failure. Single-file uploads use
+the same `upload_files/3` callback with a one-item list. Custom transports must
+implement `upload_files/3`; the former `upload_file/3` callback has been removed.
+Server-configured size and attachment-count limits are enforced by Mattermost;
+HTTP failures propagate to the caller. Metadata contains ordered `file_ids`,
+`media`, and attachment snapshots for all files; singular metadata fields describe
+the first file for compatibility.
