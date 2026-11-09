@@ -187,3 +187,10 @@ server's `FileSettings.MaxFileSize`; it is not discovered automatically. This is
 required for single-file sends, multiple-file posts, and attachment edits.
 Text-only operations do not require it. See the
 [README configuration example](../README.md#configuration).
+
+Call `Adapter.validate_files/2` before materialization to check declared sizes.
+It accepts lazy file maps/structs with `name` or `filename` and `size` (also accepted
+inside `metadata`), using atom or string keys. It returns `:ok` or the first
+validation error, including filename, size and limit for an oversized file.
+Unknown sizes are rejected. This adapter extension does no file or network I/O;
+delivery still validates actual bytes.

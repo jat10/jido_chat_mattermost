@@ -197,6 +197,43 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     end
   end
 
+  test "SDK single-file posting preserves an explicit caption over payload text" do
+    Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "post", "file_ids" => ["file"]}})
+    [upload] = opts()[:files]
+    payload = Jido.Chat.PostPayload.new(%{text: "Payload text", files: [upload]})
+    options = opts() |> Keyword.delete(:files) |> Keyword.put(:caption, "Explicit caption")
+
+    assert {:ok, response} = Jido.Chat.Adapter.post_message(Adapter, "room", payload, options)
+    assert response.external_message_id == "post"
+    assert_received {:transport_call, :upload_files, ["room", [_], _]}
+    assert_received {:transport_call, :send_message, ["room", "Explicit caption", _]}
+    refute_received {:transport_call, _, _}
+  end
+
+  for caption <- [nil, ""] do
+    @blank_caption caption
+    test "SDK single-file posting retains the text fallback with caption #{inspect(caption)}" do
+      Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "post", "file_ids" => ["file"]}})
+      [upload] = opts()[:files]
+      payload = Jido.Chat.PostPayload.new(%{text: "Payload text", files: [upload]})
+
+      for text_options <- [[], [text: "Explicit text"]] do
+        options =
+          opts()
+          |> Keyword.delete(:files)
+          |> Keyword.put(:caption, @blank_caption)
+          |> Keyword.merge(text_options)
+
+        expected_text = Keyword.get(text_options, :text, "Payload text")
+        assert {:ok, response} = Jido.Chat.Adapter.post_message(Adapter, "room", payload, options)
+        assert response.external_message_id == "post"
+        assert_received {:transport_call, :upload_files, ["room", [_], _]}
+        assert_received {:transport_call, :send_message, ["room", ^expected_text, _]}
+        refute_received {:transport_call, _, _}
+      end
+    end
+  end
+
   test "confirmed single-file delivery preserves caption, timestamp and upload metadata" do
     post = %{
       "id" => "post",
@@ -788,6 +825,58 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
           assert rest == []
           assert [%{filename: "large.txt", reason: :file_too_large}] = report.failed_files
           assert report.confirmation == :partial
+      end
+    end
+  end
+
+  for restored? <- [false, true] do
+    @restore_partial_handle restored?
+    test "replacement does not retain a stale partial delivery report with restored handle #{@restore_partial_handle}" do
+      thread =
+        Jido.Chat.Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
+
+      files = [
+        %FileUpload{data: "old", filename: "old.txt"},
+        %FileUpload{data: String.duplicate("x", 11), filename: "oversized.txt"}
+      ]
+
+      assert {:ok, sent} =
+               Jido.Chat.Thread.post(thread, Jido.Chat.Postable.text("Original", files: files),
+                 transport: SizedTransport,
+                 max_file_size: 10
+               )
+
+      assert %{confirmation: :partial, failed_files: [%{filename: "oversized.txt"}]} =
+               sent.response.metadata.delivery_report
+
+      sent =
+        if @restore_partial_handle do
+          sent
+          |> Jido.Chat.SentMessage.to_map()
+          |> Jason.encode!()
+          |> Jason.decode!()
+          |> Jido.Chat.SentMessage.from_map()
+        else
+          sent
+        end
+
+      replacement = Jido.Chat.Postable.text("Replacement", files: [%FileUpload{data: "new", filename: "new.txt"}])
+      assert {:ok, edited} = Jido.Chat.SentMessage.edit(sent, replacement)
+      assert edited.id == sent.id
+      assert edited.metadata.file_ids == ["new.txt"]
+      assert [%{filename: "new.txt", url: "mattermost://file/new.txt"}] = edited.attachments
+
+      serialized = edited |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!()
+
+      # A single-post edit may clear the report or publish its current result.
+      # Neither representation may retain the previous operation's failures/files.
+      if report = serialized["metadata"]["delivery_report"] do
+        assert report["confirmation"] == "confirmed"
+        assert report["failed_files"] == []
+        assert [message] = report["messages"]
+        assert message["message_id"] == edited.id
+        assert message["body"] == "Replacement"
+        assert message["metadata"]["file_ids"] == ["new.txt"]
       end
     end
   end

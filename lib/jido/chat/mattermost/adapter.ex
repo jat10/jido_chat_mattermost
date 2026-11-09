@@ -47,6 +47,51 @@ defmodule Jido.Chat.Mattermost.Adapter do
   @impl true
   def channel_type, do: :mattermost
 
+  @doc """
+  Checks declared file sizes without reading or uploading content.
+
+  Accepts maps or structs with `name`/`filename` and a non-negative integer
+  `size`, at the top level or in `metadata`. Atom and string keys are supported.
+  Returns the first rejection; the entire batch must pass. Unknown sizes fail
+  validation. Delivery still checks actual bytes because metadata can be stale.
+  This is an adapter extension, independent of materialization or storage types.
+  """
+  @spec validate_files([map()], keyword()) :: :ok | {:error, term()}
+  def validate_files(files, opts \\ [])
+  def validate_files([], _opts), do: :ok
+
+  def validate_files(files, opts) when is_list(files) do
+    limit = SendOptions.new(opts).max_file_size
+
+    with :ok <- validate_upload_limit(limit) do
+      Enum.reduce_while(files, :ok, fn file, :ok ->
+        case validate_file_metadata(file, limit) do
+          :ok -> {:cont, :ok}
+          error -> {:halt, error}
+        end
+      end)
+    end
+  end
+
+  def validate_files(_files, _opts), do: {:error, :invalid_files}
+
+  defp validate_file_metadata(file, limit) when is_map(file) do
+    metadata = file_metadata_value(file, :metadata)
+    size = file_metadata_value(file, :size) || file_metadata_value(metadata, :size)
+    filename = file_metadata_value(file, :filename) || file_metadata_value(file, :name)
+
+    if is_integer(size) and size >= 0,
+      do: validate_file_size(%{filename: filename}, size, limit),
+      else: {:error, {:invalid_file_size, %{filename: filename}}}
+  end
+
+  defp validate_file_metadata(_file, _limit), do: {:error, :invalid_file_metadata}
+
+  defp file_metadata_value(map, key) when is_map(map),
+    do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
+  defp file_metadata_value(_map, _key), do: nil
+
   @impl true
   def capabilities do
     %{
@@ -195,7 +240,12 @@ defmodule Jido.Chat.Mattermost.Adapter do
         send_message(channel_id, text, opts)
 
       [file] ->
-        send_file(channel_id, file, if(text == "", do: opts, else: Keyword.put(opts, :caption, text)))
+        file_opts =
+          if text == "",
+            do: opts,
+            else: opts |> Keyword.put_new(:caption, text) |> Keyword.put_new(:text, text)
+
+        send_file(channel_id, file, file_opts)
 
       _ ->
         deliver_file_posts(channel_id, nil, text, files, opts)
@@ -234,7 +284,10 @@ defmodule Jido.Chat.Mattermost.Adapter do
       {:ok,
        %{
          response
-         | metadata: edit_response_metadata(response.metadata, result, attachment_metadata, o.previous_metadata)
+         | metadata:
+             response.metadata
+             |> edit_response_metadata(result, attachment_metadata, o.previous_metadata)
+             |> Map.put(:delivery_report, nil)
        }}
     end
   end
