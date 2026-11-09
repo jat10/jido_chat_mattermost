@@ -131,7 +131,9 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
       Jido.Chat.Postable.text("Answer", files: [%FileUpload{data: <<0, 255, 128>>, filename: "report.bin"}])
 
     assert {:ok, first} = Jido.Chat.SentMessage.edit(sent, payload, transport_opts)
-    restored = first |> Jido.Chat.SentMessage.to_map() |> Jido.Chat.SentMessage.from_map()
+
+    restored =
+      first |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> Jido.Chat.SentMessage.from_map()
 
     Process.put({RecordingTransport, :upload_files}, {:ok, %{"file_infos" => [%{"id" => "replacement"}]}})
     Process.put({RecordingTransport, :edit_message}, {:ok, %{"id" => "post", "file_ids" => ["replacement"]}})
@@ -170,6 +172,62 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
 
     assert {:error, :unconfirmed_delivery} =
              Adapter.edit_message("room", "post", "Answer", opts())
+  end
+
+  for entry <- [:send_file, :post_message], missing <- [:attachment, :message_id] do
+    @single_entry entry
+    @missing_confirmation missing
+    test "#{entry} rejects single-file delivery without confirmed #{missing}" do
+      post =
+        case @missing_confirmation do
+          :attachment -> %{"id" => "post", "file_ids" => []}
+          :message_id -> %{"file_ids" => ["file"]}
+        end
+
+      Process.put({RecordingTransport, :send_message}, {:ok, post})
+      [upload] = opts()[:files]
+
+      input =
+        if @single_entry == :send_file, do: upload, else: Jido.Chat.PostPayload.new(%{text: "File", files: [upload]})
+
+      assert {:error, :unconfirmed_delivery} = apply(Adapter, @single_entry, ["room", input, opts()])
+      assert_received {:transport_call, :upload_files, _}
+      assert_received {:transport_call, :send_message, _}
+      refute_received {:transport_call, _, _}
+    end
+  end
+
+  test "confirmed single-file delivery preserves caption, timestamp and upload metadata" do
+    post = %{
+      "id" => "post",
+      "channel_id" => "room",
+      "file_ids" => ["file"],
+      "create_at" => 1_700_000_000_000,
+      "user_id" => "author",
+      "root_id" => "root"
+    }
+
+    Process.put({RecordingTransport, :send_message}, {:ok, post})
+    [upload] = opts()[:files]
+    options = opts() |> Keyword.put(:caption, "Caption") |> Keyword.put(:thread_id, "root")
+
+    assert {:ok, response} = Adapter.send_file("room", upload, options)
+    assert response.external_message_id == "post"
+    assert response.external_room_id == "room"
+    assert response.status == :sent
+    assert response.raw == post
+    assert response.timestamp == post["create_at"]
+    assert response.metadata.source_author_id == "author"
+    assert response.metadata.file_ids == ["file"]
+    assert response.metadata.filename == upload.filename
+    assert response.metadata.upload_kind == upload.kind
+    assert response.metadata.upload == %{"file_infos" => [%{"id" => "file"}]}
+    assert [attachment] = response.metadata.attachments
+    assert attachment.url == "mattermost://file/file"
+    assert_received {:transport_call, :upload_files, _}
+    assert_received {:transport_call, :send_message, ["room", "Caption", forwarded]}
+    assert forwarded[:file_ids] == ["file"]
+    assert forwarded[:thread_id] == "root"
   end
 
   test "text-only edits preserve media metadata for existing attachments" do
@@ -378,7 +436,10 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert serialized["metadata"]["file_ids"] == ["one", "two"]
 
     Process.put({RecordingTransport, :edit_message}, {:ok, %{"id" => "post", "file_ids" => ["one", "two"]}})
-    restored = sent |> Jido.Chat.SentMessage.to_map() |> Map.put("default_opts", []) |> Jido.Chat.SentMessage.from_map()
+
+    restored =
+      sent |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> Jido.Chat.SentMessage.from_map()
+
     assert {:ok, sparse} = Jido.Chat.SentMessage.edit(restored, "Sparse response", Keyword.delete(opts(), :files))
     assert sparse.metadata.filename == "one.txt"
     assert sparse.metadata.content_type == "text/plain; charset=utf-8"
@@ -404,7 +465,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
       Process.put({RecordingTransport, :edit_message}, {:ok, post})
 
       restored =
-        sent |> Jido.Chat.SentMessage.to_map() |> Map.put("default_opts", []) |> Jido.Chat.SentMessage.from_map()
+        sent |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> Jido.Chat.SentMessage.from_map()
 
       assert {:ok, edited} =
                Jido.Chat.SentMessage.edit(restored, "Updated text", Keyword.delete(opts(), :files))
@@ -429,6 +490,79 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert_received {:transport_call, :edit_message, ["room", "post", "Answer", edit_opts]}
     refute Keyword.has_key?(edit_opts, :file_ids)
     refute_received {:transport_call, :upload_files, _}
+  end
+
+  for operation <- [:post, :edit] do
+    @sparse_operation operation
+    test "#{operation} preserves each upload's details when multiple upload results contain only IDs" do
+      files = [
+        %FileUpload{data: "image", filename: "photo.png", media_type: "image/png", size_bytes: 5},
+        %FileUpload{data: "audio!", filename: "voice.ogg", media_type: "audio/ogg", size_bytes: 6}
+      ]
+
+      Process.put(
+        {RecordingTransport, :upload_files},
+        {:ok, %{"file_infos" => [%{"id" => "image-id"}, %{"id" => "audio-id"}]}}
+      )
+
+      # The post orders the attachments differently from the upload response.
+      post = {:ok, %{"id" => "post", "file_ids" => ["audio-id", "image-id"]}}
+      Process.put({RecordingTransport, :send_message}, post)
+      Process.put({RecordingTransport, :edit_message}, post)
+      options = Keyword.put(opts(), :files, files)
+
+      result =
+        case @sparse_operation do
+          :post -> Adapter.post_message("room", Jido.Chat.PostPayload.new(%{text: "Files", files: files}), options)
+          :edit -> Adapter.edit_message("room", "post", "Files", options)
+        end
+
+      assert {:ok, response} = result
+      assert response.metadata.file_ids == ["audio-id", "image-id"]
+      assert_received {:transport_call, :upload_files, ["room", [image, audio], _]}
+      assert image.filename == "photo.png"
+      assert audio.filename == "voice.ogg"
+
+      expected = [
+        {"audio-id", "voice.ogg", "audio/ogg", 6, :audio},
+        {"image-id", "photo.png", "image/png", 5, :image}
+      ]
+
+      for entries <- [response.metadata.media, response.metadata.attachments] do
+        actual = Enum.map(entries, &{&1.metadata.file_id, &1.filename, &1.media_type, &1.size_bytes, &1.kind})
+        assert actual == expected
+      end
+    end
+  end
+
+  test "multi-file metadata prefers server details and correlates duplicate filenames by upload order" do
+    files = [
+      %FileUpload{data: "image", filename: "same.bin", media_type: "image/png", size_bytes: 5},
+      %FileUpload{data: "audio!", filename: "same.bin", media_type: "audio/ogg", size_bytes: 6}
+    ]
+
+    Process.put(
+      {RecordingTransport, :upload_files},
+      {:ok,
+       %{
+         "file_infos" => [
+           %{"id" => "image-id", "name" => "server.jpg", "mime_type" => "image/jpeg", "size" => 42},
+           %{"id" => "audio-id", "name" => nil, "mime_type" => nil, "size" => nil}
+         ]
+       }}
+    )
+
+    Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "post", "file_ids" => ["audio-id", "image-id"]}})
+    payload = Jido.Chat.PostPayload.new(%{text: "Files", files: files})
+    assert {:ok, response} = Adapter.post_message("room", payload, opts())
+
+    assert [audio, image] = response.metadata.attachments
+
+    assert {audio.metadata.file_id, audio.filename, audio.media_type, audio.size_bytes, audio.kind} ==
+             {"audio-id", "same.bin", "audio/ogg", 6, :audio}
+
+    assert {image.metadata.file_id, image.filename, image.media_type, image.size_bytes, image.kind} ==
+             {"image-id", "server.jpg", "image/jpeg", 42, :image}
   end
 
   test "multiple uploads produce one post or edit with server-ordered attachment metadata" do
@@ -540,8 +674,13 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
       send(self(), {:batch, files})
 
       case Process.get(:upload_failure) do
-        nil -> {:ok, %{"file_infos" => Enum.map(files, &%{"id" => &1.filename, "name" => &1.filename})}}
-        failure -> {:error, failure}
+        nil ->
+          infos = Enum.map(files, &%{"id" => &1.filename, "name" => &1.filename})
+          infos = if Process.get(:sparse_file_infos), do: Enum.map(infos, &Map.take(&1, ["id"])), else: infos
+          {:ok, %{"file_infos" => infos}}
+
+        failure ->
+          {:error, failure}
       end
     end
 
@@ -554,13 +693,13 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
       if Process.get(:fail_post_number) == count do
         {:error, :timeout}
       else
-        {:ok, %{"id" => "post-#{count}", "file_ids" => opts[:file_ids]}}
+        {:ok, %{"id" => "post-#{count}", "file_ids" => opts[:file_ids], "root_id" => opts[:thread_id]}}
       end
     end
 
     def edit_message(_channel, id, _text, opts) do
       send(self(), {:edited, opts[:file_ids]})
-      {:ok, %{"id" => id, "file_ids" => opts[:file_ids]}}
+      {:ok, %{"id" => id, "file_ids" => opts[:file_ids], "root_id" => Process.get(:edit_root_id)}}
     end
   end
 
@@ -585,6 +724,72 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert_received {:batch, batch}
     assert length(batch) == 5
     refute_received {:batch, _}
+  end
+
+  for entry <- [Jido.Chat.Thread, Jido.Chat.ChannelRef], scenario <- [:split, :rejected] do
+    @posting_entry entry
+    @delivery_scenario scenario
+    test "#{entry} handle contains only confirmed first-post files for #{scenario} delivery" do
+      files =
+        case @delivery_scenario do
+          :split ->
+            for i <- 1..15, do: %FileUpload{data: "x", filename: "#{i}.txt"}
+
+          :rejected ->
+            [
+              %FileUpload{data: "x", filename: "valid.txt"},
+              %FileUpload{data: :binary.copy("x", 1025), filename: "large.txt"}
+            ]
+        end
+
+      target =
+        case @posting_entry do
+          Jido.Chat.Thread ->
+            Jido.Chat.Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
+
+          Jido.Chat.ChannelRef ->
+            Jido.Chat.ChannelRef.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_id: "room"})
+        end
+
+      assert {:ok, sent} =
+               @posting_entry.post(target, Jido.Chat.Postable.text("files", files: files),
+                 transport: SizedTransport,
+                 max_file_size: 1024
+               )
+
+      report = sent.response.metadata.delivery_report
+      [first | rest] = report.messages
+      assert sent.id == first.message_id
+      assert sent.attachments == first.metadata.attachments
+      assert Enum.all?(sent.attachments, &is_nil(&1.data))
+
+      restored =
+        sent |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> Jido.Chat.SentMessage.from_map()
+
+      assert restored.default_opts == Keyword.put(sent.default_opts, :transport, Atom.to_string(SizedTransport))
+      assert Enum.map(restored.attachments, & &1.url) == Enum.map(sent.attachments, & &1.url)
+      replacement = Jido.Chat.Postable.text("replacement", files: [%FileUpload{data: "new", filename: "new.txt"}])
+      assert {:ok, edited} = Jido.Chat.SentMessage.edit(restored, replacement)
+      assert edited.id == sent.id
+      assert [attachment] = edited.attachments
+      assert attachment.url == "mattermost://file/new.txt"
+
+      case @delivery_scenario do
+        :split ->
+          assert length(sent.attachments) == 10
+          assert [second] = rest
+          assert length(second.metadata.attachments) == 5
+          assert second.thread_id == first.message_id
+          assert report.confirmation == :confirmed
+
+        :rejected ->
+          assert [attachment] = sent.attachments
+          assert attachment.filename == "valid.txt"
+          assert rest == []
+          assert [%{filename: "large.txt", reason: :file_too_large}] = report.failed_files
+          assert report.confirmation == :partial
+      end
+    end
   end
 
   test "nine valid files are posted and the oversized file is reported" do
@@ -630,6 +835,44 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert options[:thread_id] == "existing"
   end
 
+  for requested_root <- [nil, "stale-root"] do
+    @requested_root requested_root
+    test "restored reply edits report and use the server root with requested root #{inspect(requested_root)}" do
+      Process.put(:edit_root_id, "existing-root")
+      defaults = [transport: SizedTransport, max_file_size: 1024]
+      defaults = if @requested_root, do: Keyword.put(defaults, :thread_id, @requested_root), else: defaults
+
+      sent =
+        Jido.Chat.SentMessage.new(%{
+          adapter: Adapter,
+          response: %{external_message_id: "reply", external_room_id: "room"},
+          default_opts: defaults
+        })
+
+      restored =
+        sent |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> Jido.Chat.SentMessage.from_map()
+
+      files = for i <- 1..15, do: %FileUpload{data: "x", filename: "#{i}.txt"}
+      assert {:ok, edited} = Jido.Chat.SentMessage.edit(restored, Jido.Chat.Postable.text("replacement", files: files))
+      assert edited.id == "reply"
+      assert length(edited.attachments) == 10
+      assert [first, second] = edited.response.metadata.delivery_report.messages
+      assert first.action == :updated
+      assert first.metadata.root_id == "existing-root"
+      assert first.thread_id == "existing-root"
+      assert second.thread_id == "existing-root"
+      assert_received {:post_opts, options}
+      assert options[:thread_id] == "existing-root"
+
+      serialized = edited |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!()
+
+      assert Enum.all?(
+               serialized["response"]["metadata"]["delivery_report"]["messages"],
+               &(&1["thread_id"] == "existing-root")
+             )
+    end
+  end
+
   test "later failure returns confirmed messages and identifies unconfirmed and unattempted files" do
     Process.put(:fail_post_number, 2)
     files = for i <- 1..25, do: %FileUpload{data: "x", filename: "#{i}.txt"}
@@ -647,7 +890,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert Process.get(:sized_post_count) == 2
   end
 
-  test "fifteen exact-limit files use fifteen upload requests and two posts" do
+  test "fifteen exact-limit files are passed to the transport in two post groups" do
     files = for i <- 1..15, do: %FileUpload{data: :binary.copy("x", 307_200), filename: "#{i}.txt"}
 
     assert {:ok, response} =
@@ -660,12 +903,37 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     assert %{messages: [first, second], confirmation: :confirmed} = response.metadata.delivery_report
     assert first.thread_id == "root"
     assert second.thread_id == "root"
-    for _ <- 1..15, do: assert_received({:batch, [_]})
+    assert_received {:batch, first_batch}
+    assert length(first_batch) == 10
+    assert_received {:batch, second_batch}
+    assert length(second_batch) == 5
     refute_received {:batch, _}
     assert_received {:posted, first_ids}
     assert length(first_ids) == 10
     assert_received {:posted, last_ids}
     assert length(last_ids) == 5
+  end
+
+  test "sparse results preserve per-file fallbacks for a transport-managed upload group" do
+    Process.put(:sparse_file_infos, true)
+
+    files = [
+      %FileUpload{data: :binary.copy("i", 1024), filename: "image.png", media_type: "image/png", size_bytes: 1024},
+      %FileUpload{data: :binary.copy("a", 1024), filename: "audio.ogg", media_type: "audio/ogg", size_bytes: 1024}
+    ]
+
+    payload = Jido.Chat.PostPayload.new(%{text: "Files", files: files})
+    assert {:ok, response} = Adapter.post_message("room", payload, transport: SizedTransport, max_file_size: 1024)
+    assert_received {:batch, [%{filename: "image.png"}, %{filename: "audio.ogg"}]}
+    refute_received {:batch, _}
+
+    assert Enum.map(
+             response.metadata.attachments,
+             &{&1.metadata.file_id, &1.filename, &1.media_type, &1.size_bytes, &1.kind}
+           ) == [
+             {"image.png", "image.png", "image/png", 1024, :image},
+             {"audio.ogg", "audio.ogg", "audio/ogg", 1024, :audio}
+           ]
   end
 
   test "file delivery requires valid size configuration before any upload" do
@@ -687,7 +955,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     refute_received {:batch, _}
   end
 
-  test "upload requests respect encoded size while all IDs go to one post or edit" do
+  test "all files for one post or edit are passed together to the selected transport" do
     files = for i <- 1..10, do: %FileUpload{data: :binary.copy("x", 290 * 1024), filename: "#{i}.txt"}
     payload = Jido.Chat.PostPayload.new(%{text: "files", files: files})
     options = [transport: SizedTransport, max_file_size: 300 * 1024]
@@ -700,7 +968,8 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
 
       assert {:ok, response} = result
       assert length(response.metadata.file_ids) == 10
-      for _ <- 1..10, do: assert_received({:batch, [_]})
+      assert_received {:batch, batch}
+      assert length(batch) == 10
       refute_received {:batch, _}
     end
 
@@ -725,7 +994,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     refute_received {:posted, _}
   end
 
-  test "an exact-limit file fits with ordinary headers and failures never post" do
+  test "an exact-limit file reaches the selected transport and failures never post" do
     options = [transport: SizedTransport, max_file_size: 1024]
     file = %FileUpload{data: :binary.copy("x", 1024), filename: "exact.txt"}
     assert {:ok, _} = Adapter.send_file("room", file, options)
@@ -734,6 +1003,19 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     Process.put(:upload_failure, :timeout)
     assert {:error, :timeout} = Adapter.send_file("room", file, options)
     refute_received {:posted, _}
+  end
+
+  test "custom transports are not constrained by Req multipart header sizes" do
+    upload = %FileUpload{data: "x", filename: String.duplicate("long", 300) <> ".txt"}
+    options = [transport: SizedTransport, max_file_size: 1]
+    assert {:ok, _} = Adapter.send_file("room", upload, options)
+    assert_received {:batch, [%{filename: filename}]}
+    assert filename == upload.filename
+    assert_received {:posted, [^filename]}
+
+    files = [upload, %FileUpload{data: "y", filename: "short.txt"}]
+    assert {:ok, _} = Adapter.post_message("room", Jido.Chat.PostPayload.new(%{files: files}), options)
+    assert_received {:batch, [_, _]}
   end
 
   defp opts do

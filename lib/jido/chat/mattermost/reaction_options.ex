@@ -6,7 +6,7 @@ defmodule Jido.Chat.Mattermost.ReactionOptions do
   @type t :: %__MODULE__{
           user_id: String.t() | nil,
           token: String.t() | nil,
-          transport: module() | nil,
+          transport: module() | String.t() | nil,
           url: String.t() | nil
         }
 

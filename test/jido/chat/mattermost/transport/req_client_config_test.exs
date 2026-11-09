@@ -30,4 +30,27 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientConfigTest do
                Jido.Chat.Mattermost.Transport.ReqClient.upload_files("c1", [file], [])
     end
   end
+
+  test "upload sizing rejects missing or invalid limits before making a request" do
+    file = %{body: "x", filename: "file.txt"}
+
+    for {limit, reason} <- [
+          {nil, :missing_configuration},
+          {0, :invalid_configuration},
+          {-1, :invalid_configuration},
+          {"10", :invalid_configuration}
+        ] do
+      assert {:error, {^reason, :max_file_size}} =
+               Jido.Chat.Mattermost.Transport.ReqClient.upload_files("room", [file], max_file_size: limit)
+    end
+  end
+
+  test "multipart overhead is checked for every file before any upload" do
+    file = %{body: "x", filename: "small.txt"}
+    long_header = %{body: "x", filename: String.duplicate("long", 1000) <> ".txt"}
+
+    # No URL or token: reaching HTTP before planning the later file would raise.
+    assert {:error, :upload_request_too_large} =
+             Jido.Chat.Mattermost.Transport.ReqClient.upload_files("room", [file, long_header], max_file_size: 1024)
+  end
 end

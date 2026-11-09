@@ -309,6 +309,34 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
   end
 
   @tag :tmp_dir
+  test "transport batches exact-limit uploads and returns ordered results for one post", %{tmp_dir: tmp_dir} do
+    limit = opts()[:max_file_size]
+    first_bytes = :binary.copy("a", limit)
+    second_bytes = :binary.copy("b", limit)
+    path = Path.join(tmp_dir, "second.txt")
+    File.write!(path, second_bytes)
+
+    files = [
+      %{body: first_bytes, filename: "first.txt", content_type: "text/plain"},
+      %{path: path, filename: "second.txt", content_type: "text/plain"},
+      %{body: "last", filename: "third.txt", content_type: "text/plain"}
+    ]
+
+    assert {:ok, %{"file_infos" => infos}} = ReqClient.upload_files(@channel_id, files, opts())
+    assert Enum.map(infos, & &1["name"]) == ["first.txt", "second.txt", "third.txt"]
+    assert Enum.map(infos, & &1["size"]) == [limit, limit, 4]
+    ids = Enum.map(infos, & &1["id"])
+    assert length(Enum.uniq(ids)) == 3
+    post = create_post("transport-managed upload batches", file_ids: ids)
+    assert {:ok, fetched} = ReqClient.fetch_post(post["id"], opts())
+    assert fetched["file_ids"] == ids
+
+    for {id, bytes} <- Enum.zip(ids, [first_bytes, second_bytes, "last"]) do
+      assert {:ok, ^bytes} = ReqClient.download_file(id, opts())
+    end
+  end
+
+  @tag :tmp_dir
   test "JPEG, PNG, GIF, WebP, and documents retain file-info MIME and original bytes", %{tmp_dir: tmp_dir} do
     fixtures =
       __DIR__

@@ -5,7 +5,7 @@ defmodule Jido.Chat.Mattermost.DeleteOptions do
 
   @type t :: %__MODULE__{
           token: String.t() | nil,
-          transport: module() | nil,
+          transport: module() | String.t() | nil,
           url: String.t() | nil
         }
 

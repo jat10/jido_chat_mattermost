@@ -462,7 +462,13 @@ Use `Postable.text("Caption", files: uploads)` with `Thread.post/3` or
 `SentMessage.edit/3` to replace the attachments on the existing post.
 An empty upload list performs a text-only edit; it does not remove attachments.
 
-File delivery requires `max_file_size` in bytes, supplied in per-call options or
+**Breaking migration:** existing single-file callers must now configure
+`max_file_size`, and custom transports must replace `upload_file/3` with
+`upload_files/3`. There is no fallback to the old callback. See the
+[README migration guide](../README.md#file-upload-migration-breaking-changes)
+for configuration examples and the transport migration contract.
+
+File delivery requires a positive integer `max_file_size` in bytes, supplied in per-call options or
 `config :jido_chat_mattermost, max_file_size: ...`. Set it to the server's
 `FileSettings.MaxFileSize`. Missing or invalid configuration returns
 `{:error, {:missing_configuration | :invalid_configuration, :max_file_size}}`
@@ -473,11 +479,17 @@ files into posts of at most ten attachments. Oversized files are omitted and
 reported individually; an entirely rejected selection returns an error. Other
 invalid file sources fail preflight before any upload.
 
-For each post it measures Req's encoded multipart body, including headers, and
-groups files into requests fitting the configured limit plus Mattermost v10's
-512-byte multipart allowance. Large valid files can upload separately while their
-IDs are attached to the same post. `Transport.upload_files/3` remains one HTTP
-request per callback; custom transports must implement it.
+The adapter calls `Transport.upload_files/3` once per post's attachment group.
+Each transport owns its request encoding, sizing, and HTTP batching. `ReqClient`
+measures its encoded multipart bodies, including headers, and plans all requests
+before uploading, fitting the configured limit plus Mattermost v10's 512-byte
+multipart allowance. Large valid files can upload separately while their IDs
+are attached to the same post. Custom transports must implement this callback
+using their own encoding rules; the adapter does not call Req's sizing helper.
+The callback returns success only after every batch is confirmed and stops on
+the first HTTP failure or incomplete upload response. Its combined `file_infos`
+response must contain one unique server file ID per input, in request order,
+so per-upload fallback metadata remains associated with the correct file.
 
 The first post contains the supplied text. Continuations contain
 `Additional files (2/2).` (with the actual indices) and reply under the first

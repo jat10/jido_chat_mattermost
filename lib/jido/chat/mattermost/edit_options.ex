@@ -8,7 +8,7 @@ defmodule Jido.Chat.Mattermost.EditOptions do
           previous_metadata: map(),
           max_file_size: pos_integer() | nil,
           token: String.t() | nil,
-          transport: module() | nil,
+          transport: module() | String.t() | nil,
           url: String.t() | nil
         }
 

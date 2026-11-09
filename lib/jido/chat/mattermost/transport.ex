@@ -9,6 +9,19 @@ defmodule Jido.Chat.Mattermost.Transport do
   @callback send_message(channel_id :: String.t(), text :: String.t(), opts :: keyword()) ::
               {:ok, map()} | {:error, term()}
 
+  @doc """
+  Uploads files, returning one `file_infos` entry per input in the same order.
+
+  Each entry must contain a unique server file ID. Optional server details take
+  precedence over the corresponding input's metadata. Preserve request order so
+  sparse responses can be correlated without relying on filenames being unique.
+
+  The adapter supplies the files for one post and `opts[:max_file_size]` in bytes.
+  The transport owns encoded request sizing and may split them into multiple HTTP
+  requests. Return success only after all uploads are confirmed; stop and return
+  an error if a request fails or returns incomplete results. Uploaded files may
+  remain stored after a later request fails. Do not create posts here.
+  """
   @callback upload_files(channel_id :: String.t(), files :: [map()], opts :: keyword()) ::
               {:ok, map()} | {:error, term()}
 

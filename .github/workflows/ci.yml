@@ -86,6 +86,8 @@ jobs:
           MM_SERVICESETTINGS_ENABLELOCALMODE: "true"
           MM_TEAMSETTINGS_ENABLEUSERCREATION: "true"
           MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION: "false"
+          # Match the integration upload limit so unsplit requests are rejected.
+          MM_FILESETTINGS_MAXFILESIZE: "307200"
           MM_LOGSETTINGS_CONSOLELEVEL: ERROR
         ports:
           - 8065:8065

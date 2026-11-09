@@ -195,7 +195,7 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
         upload = FileUpload.new(%{kind: :file, data: "bytes", filename: "attachment.bin"})
         file = %{"id" => "f1", "mime_type" => mime}
         Process.put({RecordingTransport, :upload_files}, {:ok, %{"file_infos" => [file]}})
-        Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "p1"}})
+        Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "p1", "file_ids" => ["f1"]}})
 
         assert {:ok, response} =
                  MattermostAdapter.send_file("c1", upload, max_file_size: 307_200, transport: RecordingTransport)
@@ -675,6 +675,28 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
   # ---------------------------------------------------------------------------
   # send_message/3
   # ---------------------------------------------------------------------------
+
+  test "serialized transport names dispatch sends and follow-up operations" do
+    opts = [transport: Atom.to_string(FakeTransport)]
+    assert {:ok, response} = MattermostAdapter.send_message("c1", "hello", opts)
+    assert response.external_message_id == "post_123"
+    assert_received {:send_message, "c1", "hello", _}
+    assert {:ok, %{"id" => "post_123"}} = MattermostAdapter.delete_message("c1", "post_123", opts)
+
+    assert {:ok, %{"post_id" => "post_123", "emoji_name" => "+1"}} =
+             MattermostAdapter.add_reaction("c1", "post_123", "+1", opts)
+  end
+
+  test "unknown transport names do not create atoms or dispatch requests" do
+    unknown = "Elixir.UnknownTransport#{System.unique_integer([:positive])}"
+
+    assert_raise ArgumentError, fn ->
+      MattermostAdapter.send_message("c1", "hello", transport: unknown)
+    end
+
+    assert_raise ArgumentError, fn -> String.to_existing_atom(unknown) end
+    refute_received {:send_message, _, _, _}
+  end
 
   describe "send_message/3" do
     test "posts to channel and returns a normalized response" do

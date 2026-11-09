@@ -7,7 +7,7 @@ defmodule Jido.Chat.Mattermost.SendOptions do
           thread_id: String.t() | nil,
           max_file_size: pos_integer() | nil,
           token: String.t() | nil,
-          transport: module() | nil,
+          transport: module() | String.t() | nil,
           url: String.t() | nil
         }
 

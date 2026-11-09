@@ -21,31 +21,81 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
 
   @impl true
   def upload_files(channel_id, [_ | _] = files, opts) do
-    parts =
-      Enum.reduce_while(files, {:ok, []}, fn file, {:ok, parts} ->
-        case multipart_file(file) do
-          {:ok, part} -> {:cont, {:ok, [{:files, part} | parts]}}
+    with {:ok, parts} <- multipart_files(files),
+         {:ok, limit} <- upload_limit(opts),
+         {:ok, batches} <- upload_batches(channel_id, parts, limit) do
+      Enum.reduce_while(batches, {:ok, nil}, fn batch, {:ok, previous} ->
+        with {:ok, result} <- post_multipart("/api/v4/files", [{:channel_id, channel_id} | batch], opts),
+             :ok <- confirm_upload_batch(result, length(batch)) do
+          {:cont, {:ok, merge_upload_results(previous, result)}}
+        else
           error -> {:halt, error}
         end
       end)
-
-    with {:ok, parts} <- parts do
-      post_multipart("/api/v4/files", [{:channel_id, channel_id} | Enum.reverse(parts)], opts)
     end
   end
 
   def upload_files(_channel_id, _files, _opts), do: {:error, :missing_file_source}
 
-  @doc "Returns the encoded multipart byte count used to plan an upload request."
-  @spec upload_size(String.t(), [map()]) :: non_neg_integer()
-  def upload_size(channel_id, files) do
-    parts =
-      Enum.map(files, fn file ->
-        {:ok, part} = multipart_file(file)
-        {:files, part}
-      end)
+  defp multipart_files(files) do
+    Enum.reduce_while(files, {:ok, []}, fn file, {:ok, parts} ->
+      case multipart_file(file) do
+        {:ok, part} -> {:cont, {:ok, parts ++ [{:files, part}]}}
+        error -> {:halt, error}
+      end
+    end)
+  end
 
+  defp upload_limit(opts) do
+    case Keyword.get(opts, :max_file_size, Application.get_env(:jido_chat_mattermost, :max_file_size)) do
+      nil -> {:error, {:missing_configuration, :max_file_size}}
+      limit when is_integer(limit) and limit > 0 -> {:ok, limit}
+      _ -> {:error, {:invalid_configuration, :max_file_size}}
+    end
+  end
+
+  defp upload_batches(channel_id, parts, limit) do
+    # Mattermost v10 permits MaxFileSize + bytes.MinRead (512 bytes).
+    # Plan every request before uploading, using the same parts as Req.post/2.
+    Enum.reduce_while(parts, {:ok, []}, fn part, {:ok, batches} ->
+      if upload_size(channel_id, [part]) > limit + 512 do
+        {:halt, {:error, :upload_request_too_large}}
+      else
+        case List.pop_at(batches, -1) do
+          {nil, _} ->
+            {:cont, {:ok, [[part]]}}
+
+          {last, rest} ->
+            if upload_size(channel_id, last ++ [part]) <= limit + 512,
+              do: {:cont, {:ok, rest ++ [last ++ [part]]}},
+              else: {:cont, {:ok, batches ++ [[part]]}}
+        end
+      end
+    end)
+  end
+
+  defp upload_size(channel_id, parts) do
     Req.Utils.encode_form_multipart([{:channel_id, channel_id} | parts]).size
+  end
+
+  defp confirm_upload_batch(%{"file_infos" => [_ | _] = infos}, count) do
+    ids = Enum.map(infos, fn info -> if is_map(info), do: info["id"] end)
+
+    if length(ids) == count and length(Enum.uniq(ids)) == count and
+         Enum.all?(ids, &(is_binary(&1) and &1 != "")),
+       do: :ok,
+       else: {:error, :unconfirmed_upload}
+  end
+
+  defp confirm_upload_batch(_result, _count), do: {:error, :missing_uploaded_file_id}
+
+  defp merge_upload_results(nil, result), do: result
+
+  defp merge_upload_results(previous, result) do
+    Map.merge(previous, result, fn
+      key, left, right when key in ["file_infos", "client_ids"] -> left ++ right
+      _key, _left, right -> right
+    end)
   end
 
   defp multipart_file(%{path: path} = file) when is_binary(path) and path != "" do

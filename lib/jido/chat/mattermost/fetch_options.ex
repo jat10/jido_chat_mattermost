@@ -15,7 +15,7 @@ defmodule Jido.Chat.Mattermost.FetchOptions do
           after: String.t() | nil,
           direction: :asc | :desc,
           token: String.t() | nil,
-          transport: module() | nil,
+          transport: module() | String.t() | nil,
           url: String.t() | nil
         }
 

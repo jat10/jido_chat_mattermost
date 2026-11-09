@@ -132,6 +132,21 @@ Adapter.send_message(channel_id, "hello", transport: FakeTransport, ...)
 
 Never mock at the HTTP layer. Always swap the transport module.
 
+The `transport` option also accepts the full module name produced by JSON
+serialization, such as `"Elixir.MyTransport"`. The adapter resolves it to an
+existing atom immediately before transport dispatch. Unknown names raise
+`ArgumentError`; they do not create atoms or fall back to the production
+transport. The SDK leaves this adapter-specific option value unchanged.
+
+Transports supporting uploads must implement `upload_files/3`, accepting a list
+even for a single file. The former `upload_file/3` callback is no longer called.
+The adapter owns individual file-size validation, the ten-attachment post limit,
+and delivery reporting. The transport owns encoded-body sizing and HTTP batching;
+one upload callback can make several requests, returning ordered file results
+only after all succeed. `ReqClient` keeps its multipart sizing private.
+See the [file-upload migration guide](../README.md#file-upload-migration-breaking-changes)
+for the request and response contract.
+
 ---
 
 ## Multiple instances
@@ -164,3 +179,10 @@ Per-call opts override globals:
 ```elixir
 Adapter.send_message(channel_id, text, url: "...", token: "...", transport: MyTransport)
 ```
+
+File uploads additionally require a positive integer `max_file_size` in bytes,
+resolved from per-call options before application configuration. Set it to the
+server's `FileSettings.MaxFileSize`; it is not discovered automatically. This is
+required for single-file sends, multiple-file posts, and attachment edits.
+Text-only operations do not require it. See the
+[README configuration example](../README.md#configuration).

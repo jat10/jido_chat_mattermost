@@ -23,14 +23,28 @@ end
 
 ## Configuration
 
-Token and base URL can be provided per-call via opts or set globally:
+Token and base URL can be provided per-call via opts or set globally.
+File uploads also require `max_file_size`, a positive integer in bytes matching
+your Mattermost server's `FileSettings.MaxFileSize`. This applies to single-file
+sends, multiple-file posts, and attachment edits. Text-only sends and edits do
+not require it.
+
+For an application that uploads files, configure:
 
 ```elixir
 # config/runtime.exs
 config :jido_chat_mattermost,
   url: "https://mattermost.yourcompany.com",
-  token: System.get_env("MATTERMOST_BOT_TOKEN")
+  token: System.get_env("MATTERMOST_BOT_TOKEN"),
+  max_file_size: System.fetch_env!("MATTERMOST_MAX_FILE_SIZE") |> String.to_integer()
 ```
+
+Set `MATTERMOST_MAX_FILE_SIZE` in your application's environment to the server's
+limit in bytes. This example explicitly reads that environment variable; the
+adapter itself reads per-call options first, then application configuration.
+It does not discover the server limit automatically. Local size validation
+rejects oversized files before upload; server-side errors still propagate if
+the server configuration changes.
 
 ## Usage
 
@@ -57,11 +71,12 @@ alias Jido.Chat.Mattermost.Adapter
 # Reply in a thread
 {:ok, sent} = Adapter.send_message("ch001", "reply text", token: "my-token", thread_id: "root-post-id")
 
-# Upload and send a file
+# Upload and send a file (the limit can also come from global configuration)
 {:ok, sent} =
   Adapter.send_file("ch001",
     %{path: "/tmp/report.pdf", filename: "report.pdf", media_type: "application/pdf"},
     token: "my-token",
+    max_file_size: System.fetch_env!("MATTERMOST_MAX_FILE_SIZE") |> String.to_integer(),
     caption: "Latest report"
   )
 
@@ -130,6 +145,38 @@ behaviour:
 ```elixir
 Adapter.send_message("ch001", "hello", transport: MyFakeTransport, token: "x")
 ```
+
+### File-upload migration (breaking changes)
+
+Existing integrations must make two changes when adopting multiple-file delivery:
+
+1. **Configure `max_file_size` for every upload path.** Calls to `send_file/3`
+   that previously needed only authentication now also need this setting, either
+   in per-call options or application configuration as shown above. The same
+   requirement applies when posting or editing attachments through the SDK.
+   Missing configuration returns `{:error, {:missing_configuration, :max_file_size}}`;
+   values other than positive integers return
+   `{:error, {:invalid_configuration, :max_file_size}}`. Both fail before upload.
+2. **Update custom transports from `upload_file/3` to `upload_files/3`.** The
+   adapter's public `send_file/3` API remains available, but it now calls the
+   plural transport callback with a one-element list. There is no fallback to
+   the old singular callback. The bundled `Transport.ReqClient` already implements
+   the new contract.
+
+For a custom transport, replace `upload_file(channel_id, file, opts)` with
+`upload_files(channel_id, files, opts)`. Each call supplies the files for one post;
+the transport owns request encoding, sizing, and splitting them into HTTP requests
+using `opts[:max_file_size]`. Each input map contains `:body` or `:path`, plus
+`:filename` and `:content_type`. Return `{:ok, %{"file_infos" => infos}}` with one entry per
+input, in request order, each containing a unique server `"id"`. Preserve this
+order even when filenames are duplicated; the adapter uses it to associate
+missing server details with the corresponding upload. Return `{:error, reason}`
+on failure, stopping further requests and returning no partial success. Previously
+uploaded files can remain stored after a later request fails. The post response must confirm a nonempty message ID and all uploaded
+file IDs before the adapter reports successful delivery.
+
+See [the adapter reference](docs/jido_chat_adapter.md#multiple-file-posts-and-edits)
+for batching and delivery-report behavior.
 
 ## Capability Matrix
 
