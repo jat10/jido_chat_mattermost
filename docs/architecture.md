@@ -181,6 +181,7 @@ Adapter.send_message(channel_id, text, url: "...", token: "...", transport: MyTr
 ```
 
 File uploads additionally require a positive integer `max_file_size` in bytes,
+advertised by `configurable_max_file_size: :native` in the adapter capability matrix,
 resolved from per-call options before application configuration. Set it to the
 server's `FileSettings.MaxFileSize`; it is not discovered automatically. This is
 required for single-file sends, multiple-file posts, and attachment edits.

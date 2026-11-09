@@ -54,6 +54,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
       shutdown: :fallback,
       send_message: :native,
       send_file: :native,
+      configurable_max_file_size: :native,
       post_message: :native,
       multi_file: :native,
       edit_message: :native,

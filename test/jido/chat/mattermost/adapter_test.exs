@@ -724,6 +724,12 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
   end
 
   describe "adapter capabilities" do
+    test "advertises configurable upload size through the SDK capability matrix" do
+      assert MattermostAdapter.capabilities().configurable_max_file_size == :native
+      assert Adapter.capabilities(MattermostAdapter).configurable_max_file_size == :native
+      assert :ok = Adapter.validate_capabilities(MattermostAdapter)
+    end
+
     test "declares explicit compatibility surface with native media upload" do
       caps = MattermostAdapter.capabilities()
 
