@@ -329,7 +329,9 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
     assert length(Enum.uniq(ids)) == 3
     post = create_post("transport-managed upload batches", file_ids: ids)
     assert {:ok, fetched} = ReqClient.fetch_post(post["id"], opts())
-    assert fetched["file_ids"] == ids
+    # Mattermost may reorder attachments when persisting the post. Upload results
+    # must preserve input order, but the saved post only needs every uploaded ID.
+    assert Enum.sort(fetched["file_ids"]) == Enum.sort(ids)
 
     for {id, bytes} <- Enum.zip(ids, [first_bytes, second_bytes, "last"]) do
       assert {:ok, ^bytes} = ReqClient.download_file(id, opts())
