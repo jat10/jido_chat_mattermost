@@ -21,6 +21,11 @@ defmodule Jido.Chat.Mattermost.Transport do
   requests. Return success only after all uploads are confirmed; stop and return
   an error if a request fails or returns incomplete results. Uploaded files may
   remain stored after a later request fails. Do not create posts here.
+
+  With `attachment_failure_policy: :continue | :abort`, retain confirmed earlier
+  batches in `{:error, {:partial_upload, %{reason: reason, uploaded: result}}}`.
+  `result.file_infos` contains only the confirmed input prefix, in order. The
+  adapter decides whether to publish it; never retry a failed batch here.
   """
   @callback upload_files(channel_id :: String.t(), files :: [map()], opts :: keyword()) ::
               {:ok, map()} | {:error, term()}

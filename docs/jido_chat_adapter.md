@@ -457,6 +457,23 @@ An absent attachment snapshot leaves the SDK's existing fallback behavior intact
 ### Multiple-file posts and edits
 
 The adapter declares `post_message: :native` and `multi_file: :native`.
+It also declares `attachment_failure_policy: :native`, independently of message
+and attachment editing. Existing send, post and attachment-edit callbacks accept
+`attachment_failure_policy: :continue | :abort`. Omitting it retains the legacy
+delivery behavior described below.
+
+With `:abort`, every planned file upload completes before the first post or update;
+any preflight/upload failure returns an error without final publication. With
+`:continue`, usable uploads are published and failures are reported; an entirely
+failed file selection publishes text once. Successful uploads are reused within
+the invocation. No public upload/publish handoff or retry is involved.
+
+Policy-mode delivery reports additionally retain `uploaded_files`, separate from
+confirmed `messages`. Failures before publication return
+`{:error, {:attachment_delivery_failed, report}}` with `delivery: :not_sent`;
+uncertain publication uses `delivery: :unconfirmed`. Later publication failure can
+leave earlier confirmed posts, reported as a partial success. Strict mode does not
+make multiple post publication atomic, and orphaned uploads may remain.
 Use `Postable.text("Caption", files: uploads)` with `Thread.post/3` or
 `ChannelRef.post/3` to attach multiple files to one post, or with
 `SentMessage.edit/3` to replace the attachments on the existing post.
@@ -490,6 +507,11 @@ The callback returns success only after every batch is confirmed and stops on
 the first HTTP failure or incomplete upload response. Its combined `file_infos`
 response must contain one unique server file ID per input, in request order,
 so per-upload fallback metadata remains associated with the correct file.
+For a supplied failure policy, a later failed HTTP batch returns the confirmed
+input prefix as `{:error, {:partial_upload, %{reason: reason, uploaded: result}}}`.
+Only earlier fully confirmed batches appear in `result.file_infos`, in input
+order. The adapter can publish that prefix in continue mode without reuploading;
+strict mode reports it without publication. No failed HTTP batch is retried.
 
 The first post contains the supplied text. Continuations contain
 `Additional files (2/2).` (with the actual indices) and reply under the first

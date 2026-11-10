@@ -25,17 +25,38 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
          {:ok, limit} <- upload_limit(opts),
          {:ok, batches} <- upload_batches(channel_id, parts, limit) do
       Enum.reduce_while(batches, {:ok, nil}, fn batch, {:ok, previous} ->
-        with {:ok, result} <- post_multipart("/api/v4/files", [{:channel_id, channel_id} | batch], opts),
-             :ok <- confirm_upload_batch(result, length(batch)) do
+        with {:ok, result} <- upload_batch(channel_id, batch, opts) do
           {:cont, {:ok, merge_upload_results(previous, result)}}
         else
-          error -> {:halt, error}
+          {:error, reason} = error ->
+            if opts[:attachment_failure_policy] in [:continue, :abort] do
+              {:halt, {:error, {:partial_upload, %{reason: reason, uploaded: previous || %{"file_infos" => []}}}}}
+            else
+              {:halt, error}
+            end
         end
       end)
     end
   end
 
   def upload_files(_channel_id, _files, _opts), do: {:error, :missing_file_source}
+
+  defp upload_batch(channel_id, batch, opts) do
+    with {:ok, result} <- post_multipart("/api/v4/files", [{:channel_id, channel_id} | batch], opts),
+         :ok <- confirm_upload_batch(result, length(batch)) do
+      {:ok, result}
+    end
+  rescue
+    error ->
+      if opts[:attachment_failure_policy] in [:continue, :abort],
+        do: {:error, :transport_exception},
+        else: reraise(error, __STACKTRACE__)
+  catch
+    :exit, reason ->
+      if opts[:attachment_failure_policy] in [:continue, :abort],
+        do: {:error, :transport_exit},
+        else: exit(reason)
+  end
 
   defp multipart_files(files) do
     Enum.reduce_while(files, {:ok, []}, fn file, {:ok, parts} ->

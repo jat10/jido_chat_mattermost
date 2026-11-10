@@ -99,6 +99,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
       shutdown: :fallback,
       send_message: :native,
       send_file: :native,
+      attachment_failure_policy: :native,
       configurable_max_file_size: :native,
       post_message: :native,
       multi_file: :native,
@@ -225,7 +226,10 @@ defmodule Jido.Chat.Mattermost.Adapter do
   @impl true
   def send_file(channel_id, file, opts \\ []) do
     upload = FileUpload.normalize(file)
-    deliver_file_post(channel_id, nil, upload_caption(upload, opts), [upload], opts)
+
+    if Keyword.has_key?(opts, :attachment_failure_policy),
+      do: deliver_file_posts(channel_id, nil, upload_caption(upload, opts), [upload], opts),
+      else: deliver_file_post(channel_id, nil, upload_caption(upload, opts), [upload], opts)
   end
 
   @impl true
@@ -268,7 +272,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
       "Mattermost edit_message: file_count=#{length(o.files)}, max_file_size=#{inspect(o.max_file_size)} bytes"
     )
 
-    if length(o.files) > 1 do
+    if length(o.files) > 1 or (o.files != [] and Keyword.has_key?(opts, :attachment_failure_policy)) do
       deliver_file_posts(channel_id, post_id, text, o.files, opts)
     else
       edit_one_message(channel_id, post_id, text, o)
@@ -296,53 +300,162 @@ defmodule Jido.Chat.Mattermost.Adapter do
   # metadata.delivery_report carries every confirmed post and rejected/pending file.
   defp deliver_file_posts(channel_id, post_id, text, files, opts) do
     limit = SendOptions.new(opts).max_file_size
+    policy = Keyword.get(opts, :attachment_failure_policy)
 
-    with :ok <- validate_upload_limit(limit),
-         {:ok, valid, rejected} <- plan_files(files, limit) do
-      parts = Enum.chunk_every(valid, 10)
+    with :ok <- validate_attachment_policy(policy),
+         :ok <- validate_upload_limit(limit),
+         {:ok, valid, rejected} <- plan_files(files, limit, policy),
+         :ok <- enforce_preflight_policy(policy, rejected) do
+      parts = if valid == [], do: [[]], else: Enum.chunk_every(valid, 10)
 
       Logger.info(
         "Mattermost message plan: file_count=#{length(files)}, post_count=#{length(parts)}, rejected_file_count=#{length(rejected)}"
       )
 
-      result =
-        parts
-        |> Enum.with_index()
-        |> Enum.reduce_while({[], []}, fn {part, index}, {delivered, _} ->
-          body = if index == 0, do: text, else: "Additional files (#{index + 1}/#{length(parts)})."
-          id = if index == 0, do: post_id
-          part_opts = continuation_opts(opts, delivered)
-
-          case deliver_file_post(channel_id, id, body, part, part_opts) do
-            {:ok, response} ->
-              message = %{
-                message_id: response.external_message_id,
-                body: body,
-                thread_id: delivery_thread_id(response, part_opts),
-                action: if(id, do: :updated, else: :created),
-                confirmation: :confirmed,
-                delivery_part_index: index,
-                metadata: response.metadata
-              }
-
-              Logger.info("Mattermost message part #{index + 1}/#{length(parts)} confirmed: file_count=#{length(part)}")
-              {:cont, {delivered ++ [{response, message}], []}}
-
-            {:error, reason} ->
-              Logger.warning(
-                "Mattermost message part #{index + 1}/#{length(parts)} failed; remaining parts will not be sent"
-              )
-
-              pending = pending_files(parts, index, reason)
-              {:halt, {delivered, pending}}
-          end
-        end)
-
-      file_post_result(result, rejected)
+      with {:ok, prepared, upload_failures} <- prepare_file_parts(channel_id, parts, opts, policy) do
+        result = publish_file_parts(channel_id, post_id, text, parts, opts, prepared)
+        file_post_result(result, rejected ++ upload_failures, prepared)
+      end
     end
   end
 
-  defp plan_files(files, limit) do
+  defp publish_file_parts(channel_id, post_id, text, parts, opts, prepared) do
+    parts
+    |> Enum.with_index()
+    |> Enum.reduce_while({[], []}, fn {part, index}, {delivered, _} ->
+      body = if index == 0, do: text, else: "Additional files (#{index + 1}/#{length(parts)})."
+      id = if index == 0, do: post_id
+      part_opts = continuation_opts(opts, delivered)
+
+      result =
+        case Map.fetch(prepared, index) do
+          {:ok, %{ids: [], files: []}} when index > 0 -> :skip
+          {:ok, upload} -> publish_file_post(channel_id, id, body, upload, part_opts)
+          :error -> deliver_file_post(channel_id, id, body, part, part_opts)
+        end
+
+      case result do
+        :skip ->
+          {:cont, {delivered, []}}
+
+        {:ok, response} ->
+          message = %{
+            message_id: response.external_message_id,
+            body: body,
+            thread_id: delivery_thread_id(response, part_opts),
+            action: if(id, do: :updated, else: :created),
+            confirmation: :confirmed,
+            delivery_part_index: index,
+            metadata: response.metadata
+          }
+
+          Logger.info("Mattermost message part #{index + 1}/#{length(parts)} confirmed: file_count=#{length(part)}")
+          {:cont, {delivered ++ [{response, message}], []}}
+
+        {:error, reason} ->
+          Logger.warning(
+            "Mattermost message part #{index + 1}/#{length(parts)} failed; remaining parts will not be sent"
+          )
+
+          remaining_parts =
+            parts
+            |> Enum.with_index()
+            |> Enum.map(fn {files, part_index} -> Map.get(prepared, part_index, %{files: files}).files end)
+
+          pending = pending_files(remaining_parts, index, reason)
+          {:halt, {delivered, pending}}
+      end
+    end)
+  end
+
+  defp validate_attachment_policy(policy) when policy in [nil, :continue, :abort], do: :ok
+  defp validate_attachment_policy(policy), do: {:error, {:invalid_attachment_failure_policy, policy}}
+
+  defp enforce_preflight_policy(:abort, [_ | _] = failures),
+    do: policy_failure([], failures, [])
+
+  defp enforce_preflight_policy(_policy, _failures), do: :ok
+
+  defp prepare_file_parts(_channel_id, _parts, _opts, nil), do: {:ok, %{}, []}
+
+  defp prepare_file_parts(channel_id, parts, opts, policy) do
+    options = SendOptions.new(opts)
+    upload_opts = Keyword.put(SendOptions.transport_opts(options), :attachment_failure_policy, policy)
+
+    parts
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, %{}, []}, fn {files, index}, {:ok, prepared, failures} ->
+      case prepare_file_part(channel_id, files, transport(options), upload_opts) do
+        {:ok, upload, rejected} ->
+          next = Map.put(prepared, index, upload)
+
+          if policy == :abort and rejected != [],
+            do: {:halt, policy_failure([], failures ++ rejected, uploaded_files(next))},
+            else: {:cont, {:ok, next, failures ++ rejected}}
+      end
+    end)
+  end
+
+  defp prepare_file_part(_channel_id, [], _transport, _opts),
+    do: {:ok, %{files: [], metadata: nil, ids: []}, []}
+
+  defp prepare_file_part(channel_id, files, transport, opts) do
+    case upload_files(channel_id, files, transport, opts) do
+      {:ok, metadata, ids} ->
+        {:ok, %{files: files, metadata: metadata, ids: ids}, []}
+
+      {:error, {:partial_upload, %{uploaded: result, reason: reason}}} ->
+        prepare_uploaded_prefix(files, result, reason)
+
+      {:error, reason} ->
+        {:ok, %{files: [], metadata: nil, ids: []}, upload_failures(files, reason)}
+    end
+  rescue
+    _ -> {:ok, %{files: [], metadata: nil, ids: []}, upload_failures(files, :transport_exception)}
+  catch
+    :exit, _ -> {:ok, %{files: [], metadata: nil, ids: []}, upload_failures(files, :transport_exit)}
+  end
+
+  defp prepare_uploaded_prefix(files, %{"file_infos" => []}, reason),
+    do: {:ok, %{files: [], metadata: nil, ids: []}, upload_failures(files, reason)}
+
+  defp prepare_uploaded_prefix(files, result, reason) do
+    with {:ok, ids} <- uploaded_file_ids_result(result),
+         true <- length(ids) <= length(files),
+         :ok <- confirm_batch_upload(ids, length(uploaded_file_infos(result))) do
+      {uploaded, failed} = Enum.split(files, length(ids))
+      metadata = upload_metadata(uploaded, result)
+      {:ok, %{files: uploaded, metadata: metadata, ids: ids}, upload_failures(failed, reason)}
+    else
+      _ -> {:ok, %{files: [], metadata: nil, ids: []}, upload_failures(files, :unconfirmed_upload)}
+    end
+  end
+
+  defp upload_failures(files, reason),
+    do: Enum.map(files, &%{filename: &1.filename, reason: reason, stage: :upload, delivery: :not_sent})
+
+  defp uploaded_files(prepared) do
+    prepared
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.flat_map(fn {_index, upload} ->
+      Enum.zip_with(upload.files, upload.ids, &%{filename: &1.filename, file_id: &2})
+    end)
+  end
+
+  defp policy_failure(messages, failed, uploaded) do
+    {:error,
+     {:attachment_delivery_failed,
+      %{
+        confirmation: :not_sent,
+        delivery: :not_sent,
+        stage: :upload,
+        messages: messages,
+        failed_files: failed,
+        uploaded_files: uploaded
+      }}}
+  end
+
+  defp plan_files(files, limit, policy) do
     files
     |> FileUpload.normalize_many()
     |> Enum.reduce_while({:ok, [], []}, fn file, {:ok, valid, rejected} ->
@@ -355,11 +468,15 @@ defmodule Jido.Chat.Mattermost.Adapter do
           failure = Map.merge(details, %{reason: :file_too_large, delivery: :not_sent})
           {:cont, {:ok, valid, rejected ++ [failure]}}
 
+        {:error, reason} when not is_nil(policy) ->
+          failure = %{filename: file.filename, reason: reason, delivery: :not_sent}
+          {:cont, {:ok, valid, rejected ++ [failure]}}
+
         error ->
           {:halt, error}
       end
     end)
-    |> reject_empty_plan()
+    |> then(fn result -> if is_nil(policy), do: reject_empty_plan(result), else: result end)
   end
 
   defp reject_empty_plan({:ok, [], [failure | _]}) do
@@ -382,12 +499,8 @@ defmodule Jido.Chat.Mattermost.Adapter do
     o = SendOptions.new(opts)
     transport_opts = SendOptions.transport_opts(o)
 
-    with {:ok, metadata, ids} <- upload_files(channel_id, files, transport(o), transport_opts),
-         {:ok, post} <- transport(o).send_message(channel_id, text, Keyword.put(transport_opts, :file_ids, ids)),
-         :ok <- confirm_edited_files(post, ids),
-         :ok <- confirm_post_id(post) do
-      response = upload_response(metadata, post, channel_id)
-      {:ok, %{response | metadata: edit_response_metadata(response.metadata, post, metadata, %{})}}
+    with {:ok, metadata, ids} <- upload_files(channel_id, files, transport(o), transport_opts) do
+      publish_file_post(channel_id, nil, text, %{metadata: metadata, ids: ids}, opts)
     end
   rescue
     _ -> {:error, :transport_exception}
@@ -397,6 +510,33 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
   defp deliver_file_post(channel_id, post_id, text, files, opts) do
     edit_one_message(channel_id, post_id, text, EditOptions.new(Keyword.put(opts, :files, files)))
+  rescue
+    _ -> {:error, :transport_exception}
+  catch
+    :exit, _ -> {:error, :transport_exit}
+  end
+
+  defp publish_file_post(channel_id, post_id, text, upload, opts) do
+    o = SendOptions.new(opts)
+    transport_opts = Keyword.put(SendOptions.transport_opts(o), :file_ids, upload.ids)
+
+    result =
+      if post_id,
+        do: transport(o).edit_message(channel_id, post_id, text, transport_opts),
+        else: transport(o).send_message(channel_id, text, transport_opts)
+
+    with {:ok, post} <- result,
+         :ok <- confirm_edited_files(post, upload.ids),
+         :ok <- confirm_post_id(post) do
+      response =
+        if is_nil(post_id) and not is_nil(upload.metadata),
+          do: upload_response(upload.metadata, post, channel_id),
+          else: response_from_post(post, channel_id, if(post_id, do: :edited, else: :sent), post_id)
+
+      metadata = edit_response_metadata(response.metadata, post, upload.metadata, opts[:previous_metadata] || %{})
+      metadata = if is_nil(upload.metadata), do: Map.put(metadata, :attachments, []), else: metadata
+      {:ok, %{response | metadata: metadata}}
+    end
   rescue
     _ -> {:error, :transport_exception}
   catch
@@ -425,15 +565,32 @@ defmodule Jido.Chat.Mattermost.Adapter do
     end)
   end
 
-  defp file_post_result({[], [failure | _]}, _rejected), do: {:error, failure.reason}
-  defp file_post_result({[{response, _}], []}, []), do: {:ok, response}
+  defp file_post_result({[], [failure | _]}, _rejected, prepared) when map_size(prepared) == 0,
+    do: {:error, failure.reason}
 
-  defp file_post_result({[{response, _} | _] = delivered, pending}, rejected) do
+  defp file_post_result({[], pending}, rejected, prepared) do
+    {:error,
+     {:attachment_delivery_failed,
+      %{
+        confirmation: :unconfirmed,
+        delivery: :unconfirmed,
+        stage: :transport,
+        messages: [],
+        failed_files: rejected ++ pending,
+        uploaded_files: uploaded_files(prepared)
+      }}}
+  end
+
+  defp file_post_result({[{response, _}], []}, [], _prepared), do: {:ok, response}
+
+  defp file_post_result({[{response, _} | _] = delivered, pending}, rejected, prepared) do
     report = %{
       confirmation: if(pending == [] and rejected == [], do: :confirmed, else: :partial),
       messages: Enum.map(delivered, &elem(&1, 1)),
       failed_files: rejected ++ pending
     }
+
+    report = if map_size(prepared) == 0, do: report, else: Map.put(report, :uploaded_files, uploaded_files(prepared))
 
     {:ok, %{response | metadata: Map.put(response.metadata, :delivery_report, report)}}
   end
