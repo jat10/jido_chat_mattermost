@@ -29,6 +29,41 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientConfigTest do
       assert {:error, :missing_file_source} =
                Jido.Chat.Mattermost.Transport.ReqClient.upload_files("c1", [file], [])
     end
+
+    assert {:error, :missing_file_source} =
+             Jido.Chat.Mattermost.Transport.ReqClient.upload_files("c1", [], [])
+  end
+
+  test "policy uploads report invalid URL configuration without claiming a confirmed upload" do
+    file = %{body: "bytes", filename: "file.txt"}
+    opts = [url: "", token: "test-token", max_file_size: 1024]
+
+    for policy <- [:abort, :continue] do
+      assert {:error, {:partial_upload, %{reason: :transport_exception, uploaded: %{"file_infos" => []}}}} =
+               Jido.Chat.Mattermost.Transport.ReqClient.upload_files(
+                 "room",
+                 [file],
+                 Keyword.put(opts, :attachment_failure_policy, policy)
+               )
+    end
+
+    assert_raise ArgumentError, fn ->
+      Jido.Chat.Mattermost.Transport.ReqClient.upload_files("room", [file], opts)
+    end
+  end
+
+  @tag :tmp_dir
+  test "path-backed upload batches are fully sized before making a request", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "file.txt")
+    File.write!(path, "bytes")
+    long_header = %{body: "bytes", filename: String.duplicate("long", 1000) <> ".txt"}
+
+    assert {:error, :upload_request_too_large} =
+             Jido.Chat.Mattermost.Transport.ReqClient.upload_files(
+               "room",
+               [%{path: path}, %{body: "bytes", filename: "second.txt"}, long_header],
+               max_file_size: 1024
+             )
   end
 
   test "upload sizing rejects missing or invalid limits before making a request" do

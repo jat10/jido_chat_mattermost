@@ -7,11 +7,15 @@ defmodule Jido.Chat.Mattermost.Test.PolicyTransport do
 
     cond do
       Enum.any?(files, &(&1.filename == "fail.txt")) ->
-        {:error, :upload_rejected}
+        {:error, Process.get({__MODULE__, :upload_error}, :upload_rejected)}
 
       Enum.any?(files, &(&1.filename == "partial.txt")) ->
         {:error,
-         {:partial_upload, %{reason: :upload_rejected, uploaded: %{"file_infos" => [%{"id" => hd(files).filename}]}}}}
+         {:partial_upload,
+          %{
+            reason: Process.get({__MODULE__, :upload_error}, :upload_rejected),
+            uploaded: %{"file_infos" => [%{"id" => hd(files).filename}]}
+          }}}
 
       true ->
         {:ok, %{"file_infos" => Enum.map(files, &%{"id" => &1.filename, "name" => &1.filename})}}
@@ -27,7 +31,7 @@ defmodule Jido.Chat.Mattermost.Test.PolicyTransport do
     Process.put({__MODULE__, :publications}, count)
 
     if Process.get({__MODULE__, :fail_publication}) == count do
-      {:error, :timeout}
+      {:error, Process.get({__MODULE__, :publication_error}, :timeout)}
     else
       {:ok, %{"id" => id || "post-#{count}", "channel_id" => room, "file_ids" => opts[:file_ids] || []}}
     end

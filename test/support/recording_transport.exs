@@ -23,7 +23,11 @@ defmodule Jido.Chat.Mattermost.Test.RecordingTransport do
     @impl true
     def unquote(name)(unquote_splicing(args)) do
       send(self(), {:transport_call, unquote(name), [unquote_splicing(args)]})
-      Process.get({__MODULE__, unquote(name)}, {:error, :unexpected_call})
+
+      case Process.get({__MODULE__, unquote(name)}, {:error, :unexpected_call}) do
+        result when is_function(result, 0) -> result.()
+        result -> result
+      end
     end
   end
 end

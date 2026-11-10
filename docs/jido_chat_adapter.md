@@ -532,6 +532,14 @@ A first-part failure returns an error. No automatic retries occur; orphaned uplo
 can remain stored after failures. Per-file rejections include filename, actual
 size, configured limit, and reason.
 
+Structured `failed_files` entries use neutral atom reasons or `{:http_error, status}`,
+including upload failures and failed or pending publication parts. They retain
+per-file stage and delivery certainty without raw response bodies or transport
+exception structs. Legacy top-level `{:error, reason}` results keep their original
+internal reason; this normalization applies only to structured delivery reports.
+Upload failures have `stage: :upload`; entries without a more precise stage
+default to `:transport`.
+
 Server configuration can change after preflight. HTTP failures still propagate.
 Metadata contains ordered `file_ids`, `media`, and attachment snapshots; singular
 metadata fields describe the first file for compatibility.

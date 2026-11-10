@@ -450,7 +450,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
         delivery: :not_sent,
         stage: :upload,
         messages: messages,
-        failed_files: failed,
+        failed_files: normalize_file_failures(failed),
         uploaded_files: uploaded
       }}}
   end
@@ -576,7 +576,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
         delivery: :unconfirmed,
         stage: :transport,
         messages: [],
-        failed_files: rejected ++ pending,
+        failed_files: normalize_file_failures(rejected ++ pending),
         uploaded_files: uploaded_files(prepared)
       }}}
   end
@@ -587,13 +587,27 @@ defmodule Jido.Chat.Mattermost.Adapter do
     report = %{
       confirmation: if(pending == [] and rejected == [], do: :confirmed, else: :partial),
       messages: Enum.map(delivered, &elem(&1, 1)),
-      failed_files: rejected ++ pending
+      failed_files: normalize_file_failures(rejected ++ pending)
     }
 
     report = if map_size(prepared) == 0, do: report, else: Map.put(report, :uploaded_files, uploaded_files(prepared))
 
     {:ok, %{response | metadata: Map.put(response.metadata, :delivery_report, report)}}
   end
+
+  defp normalize_file_failures(failures) do
+    Enum.map(failures, fn failure ->
+      failure
+      |> Map.put_new(:stage, :transport)
+      |> Map.put(:reason, file_failure_reason(failure.reason))
+    end)
+  end
+
+  defp file_failure_reason(reason) when is_atom(reason) and not is_nil(reason), do: reason
+  defp file_failure_reason({:http_error, status}) when status in 100..599, do: {:http_error, status}
+  defp file_failure_reason({status, _body}) when status in 100..599, do: {:http_error, status}
+  defp file_failure_reason(%Req.TransportError{reason: reason}), do: file_failure_reason(reason)
+  defp file_failure_reason(_reason), do: :attachment_delivery_failed
 
   defp edit_file_opts(_channel_id, %EditOptions{files: []} = o),
     do: {:ok, EditOptions.transport_opts(o), nil}
