@@ -482,6 +482,10 @@ confirmed `messages`. Failures before publication return
 uncertain publication uses `delivery: :unconfirmed`. Later publication failure can
 leave earlier confirmed posts, reported as a partial success. Strict mode does not
 make multiple post publication atomic, and orphaned uploads may remain.
+When strict upload preparation stops, later groups are reported as
+`reason: :not_attempted`, `stage: :upload`, `delivery: :not_sent`.
+Unconfirmed first-publication reports retain the normalized publication error in
+`reason`, including when continue mode publishes text after all uploads fail.
 Use `Postable.text("Caption", files: uploads)` with `Thread.post/3` or
 `ChannelRef.post/3` to attach multiple files to one post, or with
 `SentMessage.edit/3` to replace the attachments on the existing post.

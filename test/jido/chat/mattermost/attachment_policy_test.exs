@@ -42,6 +42,50 @@ defmodule Jido.Chat.Mattermost.AttachmentPolicyTest do
     refute_received {:publish, _, _, _, _}
   end
 
+  for action <- [:post, :edit], failed_group <- [1, 2] do
+    @action action
+    @failed_group failed_group
+
+    @tag capture_log: true
+    test "strict #{@action} reports unattempted files after upload group #{@failed_group} fails" do
+      files =
+        Enum.map(1..21, fn index ->
+          file(if index == (@failed_group - 1) * 10 + 1, do: "fail.txt", else: "#{index}.txt")
+        end)
+
+      result =
+        case @action do
+          :post -> post(files, :abort)
+          :edit -> Adapter.edit_message("room", "existing", "Answer", Keyword.put(opts(:abort), :files, files))
+        end
+
+      assert {:error, {:attachment_delivery_failed, report}} = result
+      assert report.delivery == :not_sent
+      assert report.messages == []
+
+      for group <- files |> Enum.chunk_every(10) |> Enum.take(@failed_group) do
+        assert {:upload, names, _opts} = next_call()
+        assert names == Enum.map(group, & &1.filename)
+      end
+
+      refute_received {:upload, _, _}
+      refute_received {:publish, _, _, _, _}
+
+      uploaded = Enum.take(files, (@failed_group - 1) * 10)
+      assert Enum.map(report.uploaded_files, & &1.filename) == Enum.map(uploaded, & &1.filename)
+
+      expected_pending =
+        files
+        |> Enum.drop(@failed_group * 10)
+        |> Enum.map(&%{filename: &1.filename, reason: :not_attempted, stage: :upload, delivery: :not_sent})
+
+      assert Enum.filter(report.failed_files, &(&1.reason == :not_attempted)) == expected_pending
+
+      reported_names = Enum.map(report.uploaded_files ++ report.failed_files, & &1.filename)
+      assert Enum.sort(reported_names) == Enum.sort(Enum.map(files, & &1.filename))
+    end
+  end
+
   test "continue keeps valid files after preflight rejection and reports only published files" do
     assert {:ok, sent} = post([file("large.txt", "too big"), file("ok.txt")], :continue, max_file_size: 3)
     assert sent.response.metadata.file_ids == ["ok.txt"]
@@ -159,6 +203,57 @@ defmodule Jido.Chat.Mattermost.AttachmentPolicyTest do
       assert_received {:publish, ^action, _, "Answer", _}
       refute_received {:upload, _, _}
       refute_received {:publish, _, _, _, _}
+    end
+  end
+
+  for action <- [:send, :edit], later_upload_succeeds? <- [false, true] do
+    @action action
+    @later_upload_succeeds later_upload_succeeds?
+
+    @tag capture_log: true
+    test "continue #{@action} retains text publication failure after failed uploads (successful later group: #{@later_upload_succeeds})" do
+      Process.put({PolicyTransport, :fail_publication}, 1)
+      Process.put({PolicyTransport, :publication_error}, {:http_error, 401})
+      failed_group = [file("fail.txt") | Enum.map(2..10, &file("#{&1}.txt"))]
+      files = if @later_upload_succeeds, do: failed_group ++ [file("11.txt")], else: failed_group
+
+      result =
+        case @action do
+          :send -> post(files, :continue)
+          :edit -> Adapter.edit_message("room", "existing", "Answer", Keyword.put(opts(:continue), :files, files))
+        end
+
+      assert {:error, {:attachment_delivery_failed, report}} = result
+      assert report.delivery == :unconfirmed
+      assert report.stage == :transport
+      assert report.messages == []
+      assert {:upload, failed_names, _} = next_call()
+      assert failed_names == Enum.map(failed_group, & &1.filename)
+
+      if @later_upload_succeeds do
+        assert {:upload, ["11.txt"], _} = next_call()
+        assert report.uploaded_files == [%{filename: "11.txt", file_id: "11.txt"}]
+
+        assert List.last(report.failed_files) == %{
+                 filename: "11.txt",
+                 reason: :not_attempted,
+                 stage: :transport,
+                 delivery: :not_sent
+               }
+      else
+        assert report.uploaded_files == []
+      end
+
+      assert {:publish, @action, _, "Answer", publication_opts} = next_call()
+      assert publication_opts[:file_ids] in [nil, []]
+      refute_received {:upload, _, _}
+      refute_received {:publish, _, _, _, _}
+
+      expected_upload_failures =
+        Enum.map(failed_group, &%{filename: &1.filename, reason: :upload_rejected, stage: :upload, delivery: :not_sent})
+
+      assert Enum.filter(report.failed_files, &(&1.stage == :upload)) == expected_upload_failures
+      assert Map.fetch(report, :reason) == {:ok, {:http_error, 401}}
     end
   end
 

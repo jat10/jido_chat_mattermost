@@ -325,7 +325,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
   defp publish_file_parts(channel_id, post_id, text, parts, opts, prepared) do
     parts
     |> Enum.with_index()
-    |> Enum.reduce_while({[], []}, fn {part, index}, {delivered, _} ->
+    |> Enum.reduce_while({[], [], nil}, fn {part, index}, {delivered, _, _} ->
       body = if index == 0, do: text, else: "Additional files (#{index + 1}/#{length(parts)})."
       id = if index == 0, do: post_id
       part_opts = continuation_opts(opts, delivered)
@@ -339,7 +339,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
       case result do
         :skip ->
-          {:cont, {delivered, []}}
+          {:cont, {delivered, [], nil}}
 
         {:ok, response} ->
           message = %{
@@ -353,7 +353,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
           }
 
           Logger.info("Mattermost message part #{index + 1}/#{length(parts)} confirmed: file_count=#{length(part)}")
-          {:cont, {delivered ++ [{response, message}], []}}
+          {:cont, {delivered ++ [{response, message}], [], nil}}
 
         {:error, reason} ->
           Logger.warning(
@@ -366,7 +366,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
             |> Enum.map(fn {files, part_index} -> Map.get(prepared, part_index, %{files: files}).files end)
 
           pending = pending_files(remaining_parts, index, reason)
-          {:halt, {delivered, pending}}
+          {:halt, {delivered, pending, reason}}
       end
     end)
   end
@@ -408,9 +408,12 @@ defmodule Jido.Chat.Mattermost.Adapter do
         {:ok, upload, rejected} ->
           next = Map.put(prepared, index, upload)
 
-          if policy == :abort and rejected != [],
-            do: {:halt, policy_failure([], failures ++ rejected, uploaded_files(next))},
-            else: {:cont, {:ok, next, failures ++ rejected}}
+          if policy == :abort and rejected != [] do
+            pending = parts |> Enum.drop(index + 1) |> List.flatten() |> upload_failures(:not_attempted)
+            {:halt, policy_failure([], failures ++ rejected ++ pending, uploaded_files(next))}
+          else
+            {:cont, {:ok, next, failures ++ rejected}}
+          end
       end
     end)
   end
@@ -593,25 +596,26 @@ defmodule Jido.Chat.Mattermost.Adapter do
     end)
   end
 
-  defp file_post_result({[], [failure | _]}, _rejected, prepared) when map_size(prepared) == 0,
-    do: {:error, failure.reason}
+  defp file_post_result({[], _pending, reason}, _rejected, prepared) when map_size(prepared) == 0,
+    do: {:error, reason}
 
-  defp file_post_result({[], pending}, rejected, prepared) do
+  defp file_post_result({[], pending, reason}, rejected, prepared) do
     {:error,
      {:attachment_delivery_failed,
       %{
         confirmation: :unconfirmed,
         delivery: :unconfirmed,
         stage: :transport,
+        reason: file_failure_reason(reason),
         messages: [],
         failed_files: normalize_file_failures(rejected ++ pending),
         uploaded_files: uploaded_files(prepared)
       }}}
   end
 
-  defp file_post_result({[{response, _}], []}, [], _prepared), do: {:ok, response}
+  defp file_post_result({[{response, _}], [], nil}, [], _prepared), do: {:ok, response}
 
-  defp file_post_result({[{response, _} | _] = delivered, pending}, rejected, prepared) do
+  defp file_post_result({[{response, _} | _] = delivered, pending, _reason}, rejected, prepared) do
     report = %{
       confirmation: if(pending == [] and rejected == [], do: :confirmed, else: :partial),
       messages: Enum.map(delivered, &elem(&1, 1)),
