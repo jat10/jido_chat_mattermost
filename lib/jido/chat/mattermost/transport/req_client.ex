@@ -16,14 +16,12 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
       |> Map.merge(thread_params(opts))
       |> maybe_put_body("file_ids", opts[:file_ids])
 
-    post("/api/v4/posts", body, opts)
+    policy_request(opts, fn -> post("/api/v4/posts", body, opts) end)
   end
 
   @impl true
   def upload_files(channel_id, [_ | _] = files, opts) do
-    with {:ok, parts} <- multipart_files(files),
-         {:ok, limit} <- upload_limit(opts),
-         {:ok, batches} <- upload_batches(channel_id, parts, limit) do
+    with {:ok, batches} <- policy_boundary(opts, fn -> prepare_upload_batches(channel_id, files, opts) end) do
       Enum.reduce_while(batches, {:ok, nil}, fn batch, {:ok, previous} ->
         with {:ok, result} <- upload_batch(channel_id, batch, opts) do
           {:cont, {:ok, merge_upload_results(previous, result)}}
@@ -41,21 +39,20 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
 
   def upload_files(_channel_id, _files, _opts), do: {:error, :missing_file_source}
 
-  defp upload_batch(channel_id, batch, opts) do
-    with {:ok, result} <- post_multipart("/api/v4/files", [{:channel_id, channel_id} | batch], opts),
-         :ok <- confirm_upload_batch(result, length(batch)) do
-      {:ok, result}
+  defp prepare_upload_batches(channel_id, files, opts) do
+    with {:ok, parts} <- multipart_files(files),
+         {:ok, limit} <- upload_limit(opts) do
+      upload_batches(channel_id, parts, limit)
     end
-  rescue
-    error ->
-      if opts[:attachment_failure_policy] in [:continue, :abort],
-        do: {:error, :transport_exception},
-        else: reraise(error, __STACKTRACE__)
-  catch
-    :exit, reason ->
-      if opts[:attachment_failure_policy] in [:continue, :abort],
-        do: {:error, :transport_exit},
-        else: exit(reason)
+  end
+
+  defp upload_batch(channel_id, batch, opts) do
+    policy_request(opts, fn ->
+      with {:ok, result} <- post_multipart("/api/v4/files", [{:channel_id, channel_id} | batch], opts),
+           :ok <- confirm_upload_batch(result, length(batch)) do
+        {:ok, result}
+      end
+    end)
   end
 
   defp multipart_files(files) do
@@ -147,7 +144,7 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
       %{"id" => post_id, "channel_id" => channel_id, "message" => text}
       |> maybe_put_body("file_ids", opts[:file_ids])
 
-    put("/api/v4/posts/#{post_id}", body, opts)
+    policy_request(opts, fn -> put("/api/v4/posts/#{post_id}", body, opts) end)
   end
 
   @impl true
@@ -226,6 +223,40 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
   end
 
   # --- private helpers ---
+
+  defp policy_request(opts, request) do
+    policy_boundary(opts, fn ->
+      case request.() do
+        {:error, reason} = error ->
+          if opts[:attachment_failure_policy] in [:continue, :abort],
+            do: {:error, policy_failure_reason(reason)},
+            else: error
+
+        result ->
+          result
+      end
+    end)
+  end
+
+  defp policy_boundary(opts, request) do
+    if opts[:attachment_failure_policy] in [:continue, :abort] do
+      try do
+        request.()
+      rescue
+        _ -> {:error, :transport_exception}
+      catch
+        :exit, _ -> {:error, :transport_exit}
+      end
+    else
+      request.()
+    end
+  end
+
+  defp policy_failure_reason(%Req.TransportError{reason: reason}), do: policy_failure_reason(reason)
+  defp policy_failure_reason(reason) when is_atom(reason) and not is_nil(reason), do: reason
+  defp policy_failure_reason({:http_error, status}) when status in 100..599, do: {:http_error, status}
+  defp policy_failure_reason({status, _body}) when status in 100..599, do: {:http_error, status}
+  defp policy_failure_reason(_reason), do: :attachment_delivery_failed
 
   defp resolve_user_id(opts) do
     case opts[:user_id] do

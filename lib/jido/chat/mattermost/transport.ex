@@ -4,6 +4,22 @@ defmodule Jido.Chat.Mattermost.Transport do
 
   Implement this behaviour to swap out the real HTTP client with a test double
   without hitting a live Mattermost server.
+
+  With `attachment_failure_policy: :continue | :abort`, upload and publication
+  callbacks return transport-neutral failure reasons: a non-nil atom (such as
+  `:timeout` or `:econnrefused`) or `{:http_error, status}` for HTTP statuses
+  100..599. Use `:transport_exception` for raised exceptions, `:transport_exit`
+  for exits, and `:attachment_delivery_failed` for unclassified failures.
+  Never include response bodies, credentials, or HTTP-library exception structs
+  in policy-mode failures. Partial upload results retain their confirmed prefix
+  and put the neutral reason in `partial_upload.reason`.
+
+  The adapter forwards the normalized policy to upload and publication callbacks.
+  Calls without an explicit policy retain their legacy error results. To sanitize
+  structured reports from those calls, the adapter also accepts `{status, body}`
+  and generic `%{reason: reason}` envelopes, recursively keeping only the neutral
+  category and discarding every other field. Custom transports can use these
+  envelopes without coupling the adapter to their exception types.
   """
 
   @callback send_message(channel_id :: String.t(), text :: String.t(), opts :: keyword()) ::

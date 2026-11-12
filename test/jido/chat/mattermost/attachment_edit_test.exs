@@ -1,7 +1,7 @@
 defmodule Jido.Chat.Mattermost.AttachmentEditTest do
   use ExUnit.Case, async: true
 
-  alias Jido.Chat.FileUpload
+  alias Jido.Chat.{FileUpload, Postable, SentMessage, Thread}
   alias Jido.Chat.Mattermost.Adapter
   alias Jido.Chat.Mattermost.Test.RecordingTransport
 
@@ -1117,4 +1117,105 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
       ]
     ]
   end
+
+  describe "attachment continuation routing" do
+    @describetag capture_log: true
+
+    for {entry, restored?} <- [edit: false, edit: true, post: false],
+        policy <- [nil, :continue, :abort],
+        root_key <- [:root_id, "root_id"],
+        {root, saved_root} <- [
+          {"", "stale-other-root"},
+          {"server-root", "stale-other-root"},
+          {:omitted, "saved-root"},
+          {:omitted, nil}
+        ] do
+      @entry entry
+      @restored restored?
+      @policy policy
+      @root_key root_key
+      @root root
+      @saved_root saved_root
+
+      test "#{entry} restored=#{restored?} policy=#{inspect(policy)} #{inspect(root_key)}=#{inspect(root)} saved=#{inspect(saved_root)}" do
+        files = for i <- 1..11, do: %FileUpload{filename: "#{i}.txt", data: "x"}
+        first_ids = Enum.map(Enum.take(files, 10), & &1.filename)
+        last_ids = ["11.txt"]
+        first_id = "original"
+        first_post = server_post(first_id, first_ids, @root_key, @root)
+
+        Process.put({RecordingTransport, :upload_files}, fn ->
+          count = Process.get(:upload_count, 0)
+          Process.put(:upload_count, count + 1)
+          ids = if count == 0, do: first_ids, else: last_ids
+          {:ok, %{"file_infos" => Enum.map(ids, &%{"id" => &1, "name" => &1})}}
+        end)
+
+        Process.put({RecordingTransport, :edit_message}, {:ok, first_post})
+
+        Process.put({RecordingTransport, :send_message}, fn ->
+          count = Process.get(:send_count, 0)
+          Process.put(:send_count, count + 1)
+
+          if @entry == :post and count == 0,
+            do: {:ok, first_post},
+            else: {:ok, %{"id" => "continuation", "file_ids" => last_ids}}
+        end)
+
+        defaults = [transport: RecordingTransport, max_file_size: 1024, thread_id: @saved_root]
+        defaults = if @policy, do: Keyword.put(defaults, :attachment_failure_policy, @policy), else: defaults
+        payload = Postable.text("Replacement", files: files)
+
+        result =
+          if @entry == :edit do
+            sent =
+              SentMessage.new(%{
+                adapter: Adapter,
+                response: %{external_message_id: first_id, external_room_id: "room"},
+                default_opts: defaults
+              })
+
+            sent = if @restored, do: restore(sent), else: sent
+            SentMessage.edit(sent, payload)
+          else
+            thread = Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
+            Thread.post(thread, payload, defaults)
+          end
+
+        assert {:ok, delivered} = result
+
+        first_thread =
+          case @root do
+            "" -> first_id
+            :omitted -> @saved_root
+            root -> root
+          end
+
+        continuation_thread = continuation_target(first_thread, first_id)
+
+        if @entry == :post, do: assert_received({:transport_call, :send_message, ["room", "Replacement", _]})
+        assert_received {:transport_call, :send_message, ["room", "Additional files (2/2).", continuation_opts]}
+        assert continuation_opts[:thread_id] == continuation_thread
+        assert continuation_opts[:file_ids] == last_ids
+        assert delivered.id == first_id
+        assert Enum.map(delivered.attachments, & &1.metadata.file_id) == first_ids
+
+        assert %{confirmation: :confirmed, messages: [first, second], failed_files: []} =
+                 delivered.response.metadata.delivery_report
+
+        assert first.message_id == first_id
+        assert first.thread_id == first_thread
+        assert second.thread_id == continuation_thread
+        assert first.metadata.file_ids == first_ids
+        assert second.metadata.file_ids == last_ids
+        refute_received {:transport_call, :send_message, _}
+      end
+    end
+  end
+
+  defp server_post(id, ids, _key, :omitted), do: %{"id" => id, "file_ids" => ids}
+  defp server_post(id, ids, key, root), do: Map.put(%{"id" => id, "file_ids" => ids}, key, root)
+  defp continuation_target(nil, id), do: id
+  defp continuation_target(root, _id), do: root
+  defp restore(sent), do: sent |> SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> SentMessage.from_map()
 end

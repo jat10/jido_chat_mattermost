@@ -462,6 +462,14 @@ and attachment editing. Existing send, post and attachment-edit callbacks accept
 `attachment_failure_policy: :continue | :abort`. Omitting it retains the legacy
 delivery behavior described below.
 
+Policies are normalized (`"abort"`/`"continue"` become atoms) and validated on
+send, post, and edit routes regardless of attachment count. Unknown policies fail
+before transport calls. Text-only sends, posts, and edits validate and forward the
+policy without uploading, requiring `max_file_size`, or generating attachment
+failure reports. Omitted policies preserve ordinary returned transport errors;
+file delivery contains transport exceptions/exits as `:transport_exception` or
+`:transport_exit` for both single-file and multiple-file operations.
+
 With `:abort`, every planned file upload completes before the first post or update;
 any preflight/upload failure returns an error without final publication. With
 `:continue`, usable uploads are published and failures are reported; an entirely
@@ -517,6 +525,10 @@ The first post contains the supplied text. Continuations contain
 `Additional files (2/2).` (with the actual indices) and reply under the first
 post, or under the existing thread root. For an attachment edit, the first part
 updates the existing message and subsequent parts become thread replies.
+An explicit server `root_id: ""` confirms a root post: continuations reply under
+that post ID, even when saved options contain a different thread ID. Nonempty
+server roots take precedence; saved thread options are used only when the server
+omits root information. Delivery reports use the same routing decision.
 
 The SDK still returns one `SentMessage`, bound to the first confirmed post. When
 multiple posts or rejected/pending files are involved, its response metadata has
@@ -537,6 +549,12 @@ including upload failures and failed or pending publication parts. They retain
 per-file stage and delivery certainty without raw response bodies or transport
 exception structs. Legacy top-level `{:error, reason}` results keep their original
 internal reason; this normalization applies only to structured delivery reports.
+In policy mode, transports normalize their own library-specific failures before
+returning them: non-nil atoms, `{:http_error, status}`, `:transport_exception`,
+`:transport_exit`, or `:attachment_delivery_failed` for unknown failures. The
+adapter also sanitizes legacy HTTP tuples and generic `%{reason: reason}`
+envelopes without depending on concrete exception types. See the
+`Jido.Chat.Mattermost.Transport` contract.
 Upload failures have `stage: :upload`; entries without a more precise stage
 default to `:transport`.
 

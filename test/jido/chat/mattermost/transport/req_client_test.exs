@@ -41,6 +41,21 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
     assert unchanged["message"] == "authentication failure target"
   end
 
+  test "policy HTTP failures are neutral for uploads and final publication" do
+    opts = Keyword.put(opts(), :token, Base.encode16(:crypto.strong_rand_bytes(24)))
+
+    for policy <- [:abort, :continue] do
+      policy_opts = Keyword.put(opts, :attachment_failure_policy, policy)
+      assert {:error, {:http_error, 401}} = ReqClient.send_message(@channel_id, "unauthorized", policy_opts)
+
+      assert {:error, {:http_error, 401}} =
+               ReqClient.edit_message(@channel_id, "missing-post", "unauthorized", policy_opts)
+
+      assert {:error, {:partial_upload, %{reason: {:http_error, 401}, uploaded: %{"file_infos" => []}}}} =
+               ReqClient.upload_files(@channel_id, [%{body: "bytes", filename: "unauthorized.txt"}], policy_opts)
+    end
+  end
+
   test "downloading a nonexistent file preserves its HTTP error" do
     missing_id = String.duplicate("0", 26)
     assert {:error, {404, body}} = ReqClient.download_file(missing_id, opts())
@@ -379,4 +394,43 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
       assert {:ok, ^bytes} = Adapter.fetch_media(media, opts())
     end
   end
+
+  describe "local connection failures" do
+    @describetag :local_connection
+    @describetag capture_log: true
+
+    setup do
+      # A real refused connection exercises Req's error boundary without HTTP mocks
+      # or a running Mattermost instance.
+      {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1}, active: false)
+      {:ok, port} = :inet.port(socket)
+      :ok = :gen_tcp.close(socket)
+
+      {:ok, opts: [url: "http://127.0.0.1:#{port}", token: System.get_env("MATTERMOST_TOKEN", ""), max_file_size: 1024]}
+    end
+
+    for operation <- [:upload, :send, :edit] do
+      @operation operation
+
+      test "#{operation} returns neutral policy connection failures and preserves legacy errors", %{opts: opts} do
+        for policy <- [:continue, :abort] do
+          result = invoke_refused_connection(@operation, Keyword.put(opts, :attachment_failure_policy, policy))
+
+          if @operation == :upload do
+            assert {:error, {:partial_upload, %{reason: :econnrefused, uploaded: %{"file_infos" => []}}}} = result
+          else
+            assert {:error, :econnrefused} = result
+          end
+        end
+
+        assert {:error, %Req.TransportError{reason: :econnrefused}} = invoke_refused_connection(@operation, opts)
+      end
+    end
+  end
+
+  defp invoke_refused_connection(:upload, opts),
+    do: ReqClient.upload_files("room", [%{body: "bytes", filename: "file.txt"}], opts)
+
+  defp invoke_refused_connection(:send, opts), do: ReqClient.send_message("room", "Answer", opts)
+  defp invoke_refused_connection(:edit, opts), do: ReqClient.edit_message("room", "post", "Answer", opts)
 end

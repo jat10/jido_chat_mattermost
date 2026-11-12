@@ -215,44 +215,46 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
   @impl true
   def send_message(channel_id, text, opts \\ []) do
-    o = SendOptions.new(opts)
+    with {:ok, opts} <- attachment_policy_opts(opts) do
+      o = SendOptions.new(opts)
 
-    with {:ok, result} <-
-           transport(o).send_message(channel_id, text, SendOptions.transport_opts(o)) do
-      {:ok, response_from_post(result, channel_id, :sent)}
+      with {:ok, result} <- transport(o).send_message(channel_id, text, SendOptions.transport_opts(o)) do
+        {:ok, response_from_post(result, channel_id, :sent)}
+      end
     end
   end
 
   @impl true
   def send_file(channel_id, file, opts \\ []) do
-    upload = FileUpload.normalize(file)
-
-    if Keyword.has_key?(opts, :attachment_failure_policy),
-      do: deliver_file_posts(channel_id, nil, upload_caption(upload, opts), [upload], opts),
-      else: deliver_file_post(channel_id, nil, upload_caption(upload, opts), [upload], opts)
+    with {:ok, opts} <- attachment_policy_opts(opts) do
+      upload = FileUpload.normalize(file)
+      deliver_file_posts(channel_id, nil, upload_caption(upload, opts), [upload], opts)
+    end
   end
 
   @impl true
   def post_message(channel_id, payload, opts \\ []) do
-    files = Jido.Chat.PostPayload.upload_candidates(payload)
-    text = Jido.Chat.PostPayload.display_text(payload) || ""
+    with {:ok, opts} <- attachment_policy_opts(opts) do
+      files = Jido.Chat.PostPayload.upload_candidates(payload)
+      text = Jido.Chat.PostPayload.display_text(payload) || ""
 
-    Logger.info("Mattermost post_message: file_count=#{length(files)}")
+      Logger.info("Mattermost post_message: file_count=#{length(files)}")
 
-    case files do
-      [] ->
-        send_message(channel_id, text, opts)
+      case files do
+        [] ->
+          send_message(channel_id, text, opts)
 
-      [file] ->
-        file_opts =
-          if text == "",
-            do: opts,
-            else: opts |> Keyword.put_new(:caption, text) |> Keyword.put_new(:text, text)
+        [file] ->
+          file_opts =
+            if text == "",
+              do: opts,
+              else: opts |> Keyword.put_new(:caption, text) |> Keyword.put_new(:text, text)
 
-        send_file(channel_id, file, file_opts)
+          send_file(channel_id, file, file_opts)
 
-      _ ->
-        deliver_file_posts(channel_id, nil, text, files, opts)
+        _ ->
+          deliver_file_posts(channel_id, nil, text, files, opts)
+      end
     end
   end
 
@@ -266,16 +268,17 @@ defmodule Jido.Chat.Mattermost.Adapter do
   """
   @impl true
   def edit_message(channel_id, post_id, text, opts \\ []) do
-    o = EditOptions.new(opts)
+    with {:ok, opts} <- attachment_policy_opts(opts) do
+      o = EditOptions.new(opts)
 
-    Logger.info(
-      "Mattermost edit_message: file_count=#{length(o.files)}, max_file_size=#{inspect(o.max_file_size)} bytes"
-    )
+      Logger.info(
+        "Mattermost edit_message: file_count=#{length(o.files)}, max_file_size=#{inspect(o.max_file_size)} bytes"
+      )
 
-    if length(o.files) > 1 or (o.files != [] and Keyword.has_key?(opts, :attachment_failure_policy)) do
-      deliver_file_posts(channel_id, post_id, text, o.files, opts)
-    else
-      edit_one_message(channel_id, post_id, text, o)
+      case o.files do
+        [] -> edit_one_message(channel_id, post_id, text, o)
+        files -> deliver_file_posts(channel_id, post_id, text, files, opts)
+      end
     end
   end
 
@@ -291,7 +294,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
          | metadata:
              response.metadata
              |> edit_response_metadata(result, attachment_metadata, o.previous_metadata)
-             |> Map.put(:delivery_report, nil)
+             |> reset_edit_report(post_id)
        }}
     end
   end
@@ -300,10 +303,10 @@ defmodule Jido.Chat.Mattermost.Adapter do
   # metadata.delivery_report carries every confirmed post and rejected/pending file.
   defp deliver_file_posts(channel_id, post_id, text, files, opts) do
     limit = SendOptions.new(opts).max_file_size
+
     policy = Keyword.get(opts, :attachment_failure_policy)
 
-    with :ok <- validate_attachment_policy(policy),
-         :ok <- validate_upload_limit(limit),
+    with :ok <- validate_upload_limit(limit),
          {:ok, valid, rejected} <- plan_files(files, limit, policy),
          :ok <- enforce_preflight_policy(policy, rejected) do
       parts = if valid == [], do: [[]], else: Enum.chunk_every(valid, 10)
@@ -367,6 +370,22 @@ defmodule Jido.Chat.Mattermost.Adapter do
       end
     end)
   end
+
+  defp attachment_policy_opts(opts) do
+    policy = normalize_attachment_policy(Keyword.get(opts, :attachment_failure_policy))
+
+    with :ok <- validate_attachment_policy(policy) do
+      {:ok,
+       if(Keyword.has_key?(opts, :attachment_failure_policy),
+         do: Keyword.put(opts, :attachment_failure_policy, policy),
+         else: opts
+       )}
+    end
+  end
+
+  defp normalize_attachment_policy("abort"), do: :abort
+  defp normalize_attachment_policy("continue"), do: :continue
+  defp normalize_attachment_policy(policy), do: policy
 
   defp validate_attachment_policy(policy) when policy in [nil, :continue, :abort], do: :ok
   defp validate_attachment_policy(policy), do: {:error, {:invalid_attachment_failure_policy, policy}}
@@ -492,8 +511,12 @@ defmodule Jido.Chat.Mattermost.Adapter do
     Keyword.put(opts, :thread_id, root)
   end
 
-  defp delivery_thread_id(response, opts),
-    do: response.metadata[:root_id] || SendOptions.new(opts).thread_id
+  defp delivery_thread_id(response, opts) do
+    case response.metadata[:root_id] do
+      "" -> response.external_message_id
+      root_id -> root_id || SendOptions.new(opts).thread_id
+    end
+  end
 
   defp deliver_file_post(channel_id, nil, text, files, opts) do
     o = SendOptions.new(opts)
@@ -518,7 +541,12 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
   defp publish_file_post(channel_id, post_id, text, upload, opts) do
     o = SendOptions.new(opts)
-    transport_opts = Keyword.put(SendOptions.transport_opts(o), :file_ids, upload.ids)
+
+    transport_opts =
+      o
+      |> SendOptions.transport_opts()
+      |> Keyword.put(:file_ids, upload.ids)
+      |> Keyword.merge(Keyword.take(opts, [:attachment_failure_policy]))
 
     result =
       if post_id,
@@ -534,8 +562,8 @@ defmodule Jido.Chat.Mattermost.Adapter do
           else: response_from_post(post, channel_id, if(post_id, do: :edited, else: :sent), post_id)
 
       metadata = edit_response_metadata(response.metadata, post, upload.metadata, opts[:previous_metadata] || %{})
-      metadata = if is_nil(upload.metadata), do: Map.put(metadata, :attachments, []), else: metadata
-      {:ok, %{response | metadata: metadata}}
+      metadata = if is_nil(post_id) and is_nil(upload.metadata), do: Map.put(metadata, :attachments, []), else: metadata
+      {:ok, %{response | metadata: reset_edit_report(metadata, post_id)}}
     end
   rescue
     _ -> {:error, :transport_exception}
@@ -606,7 +634,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
   defp file_failure_reason(reason) when is_atom(reason) and not is_nil(reason), do: reason
   defp file_failure_reason({:http_error, status}) when status in 100..599, do: {:http_error, status}
   defp file_failure_reason({status, _body}) when status in 100..599, do: {:http_error, status}
-  defp file_failure_reason(%Req.TransportError{reason: reason}), do: file_failure_reason(reason)
+  defp file_failure_reason(%{reason: reason}), do: file_failure_reason(reason)
   defp file_failure_reason(_reason), do: :attachment_delivery_failed
 
   defp edit_file_opts(_channel_id, %EditOptions{files: []} = o),
@@ -619,6 +647,11 @@ defmodule Jido.Chat.Mattermost.Adapter do
       {:ok, Keyword.put(opts, :file_ids, ids), metadata}
     end
   end
+
+  # Explicit nil replaces the SDK handle's previous report; current-operation
+  # reporting in file_post_result/3 can then publish a fresh report when needed.
+  defp reset_edit_report(metadata, nil), do: metadata
+  defp reset_edit_report(metadata, _post_id), do: Map.put(metadata, :delivery_report, nil)
 
   defp edit_response_metadata(metadata, post, nil, previous) do
     file_ids = map_get(post, ["file_ids", :file_ids])
@@ -919,7 +952,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
       status: status,
       raw: post,
       metadata: %{
-        root_id: nilify(map_get(post, ["root_id", :root_id])),
+        root_id: map_get(post, ["root_id", :root_id]),
         source_author_id: map_get(post, ["user_id", :user_id])
       }
     })
@@ -1199,7 +1232,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
       raw: post_result,
       metadata:
         metadata
-        |> Map.put(:root_id, nilify(map_get(post_result, ["root_id", :root_id])))
+        |> Map.put(:root_id, map_get(post_result, ["root_id", :root_id]))
         |> Map.put(:source_author_id, map_get(post_result, ["user_id", :user_id]))
         |> Enum.reject(fn {_key, value} -> is_nil(value) end)
         |> Map.new()

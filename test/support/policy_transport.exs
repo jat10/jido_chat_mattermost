@@ -33,7 +33,13 @@ defmodule Jido.Chat.Mattermost.Test.PolicyTransport do
     if Process.get({__MODULE__, :fail_publication}) == count do
       {:error, Process.get({__MODULE__, :publication_error}, :timeout)}
     else
-      {:ok, %{"id" => id || "post-#{count}", "channel_id" => room, "file_ids" => opts[:file_ids] || []}}
+      post_id = id || "post-#{count}"
+      previous_ids = Process.get({__MODULE__, :file_ids, post_id}, [])
+      # ReqClient omits empty file_ids from update bodies, retaining server files.
+      ids = if opts[:file_ids] in [nil, []], do: previous_ids, else: opts[:file_ids]
+      ids = if action == :edit, do: Process.get({__MODULE__, :edit_file_ids}, ids), else: ids
+      Process.put({__MODULE__, :file_ids, post_id}, ids)
+      {:ok, %{"id" => post_id, "channel_id" => room, "message" => text, "file_ids" => ids}}
     end
   end
 
