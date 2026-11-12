@@ -308,7 +308,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
     with :ok <- validate_upload_limit(limit),
          {:ok, valid, rejected} <- plan_files(files, limit, policy),
-         :ok <- enforce_preflight_policy(policy, rejected) do
+         :ok <- enforce_preflight_policy(policy, valid, rejected) do
       parts = if valid == [], do: [[]], else: Enum.chunk_every(valid, 10)
 
       Logger.info(
@@ -390,10 +390,10 @@ defmodule Jido.Chat.Mattermost.Adapter do
   defp validate_attachment_policy(policy) when policy in [nil, :continue, :abort], do: :ok
   defp validate_attachment_policy(policy), do: {:error, {:invalid_attachment_failure_policy, policy}}
 
-  defp enforce_preflight_policy(:abort, [_ | _] = failures),
-    do: policy_failure([], failures, [])
+  defp enforce_preflight_policy(:abort, valid, [_ | _] = failures),
+    do: policy_failure([], failures ++ upload_failures(valid, :not_attempted), [])
 
-  defp enforce_preflight_policy(_policy, _failures), do: :ok
+  defp enforce_preflight_policy(_policy, _valid, _failures), do: :ok
 
   defp prepare_file_parts(_channel_id, _parts, _opts, nil), do: {:ok, %{}, []}
 

@@ -484,6 +484,8 @@ leave earlier confirmed posts, reported as a partial success. Strict mode does n
 make multiple post publication atomic, and orphaned uploads may remain.
 When strict upload preparation stops, later groups are reported as
 `reason: :not_attempted`, `stage: :upload`, `delivery: :not_sent`.
+When strict preflight rejects a selection, valid siblings receive the same
+unattempted outcome, while rejected files retain their individual reasons.
 Unconfirmed first-publication reports retain the normalized publication error in
 `reason`, including when continue mode publishes text after all uploads fail.
 Use `Postable.text("Caption", files: uploads)` with `Thread.post/3` or
