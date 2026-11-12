@@ -42,17 +42,21 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
   end
 
   test "policy HTTP failures are neutral for uploads and final publication" do
-    opts = Keyword.put(opts(), :token, Base.encode16(:crypto.strong_rand_bytes(24)))
+    post = create_post("policy authentication failure target")
+    invalid_opts = Keyword.put(opts(), :token, Base.encode16(:crypto.strong_rand_bytes(24)))
 
     for policy <- [:abort, :continue] do
-      policy_opts = Keyword.put(opts, :attachment_failure_policy, policy)
+      policy_opts = Keyword.put(invalid_opts, :attachment_failure_policy, policy)
       assert {:error, {:http_error, 401}} = ReqClient.send_message(@channel_id, "unauthorized", policy_opts)
 
       assert {:error, {:http_error, 401}} =
-               ReqClient.edit_message(@channel_id, "missing-post", "unauthorized", policy_opts)
+               ReqClient.edit_message(@channel_id, post["id"], "unauthorized", policy_opts)
 
       assert {:error, {:partial_upload, %{reason: {:http_error, 401}, uploaded: %{"file_infos" => []}}}} =
                ReqClient.upload_files(@channel_id, [%{body: "bytes", filename: "unauthorized.txt"}], policy_opts)
+
+      assert {:ok, unchanged} = ReqClient.fetch_post(post["id"], opts())
+      assert unchanged["message"] == "policy authentication failure target"
     end
   end
 
