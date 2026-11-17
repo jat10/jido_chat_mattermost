@@ -33,28 +33,23 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
 
   @doc "Encodes exactly one materialized candidate, without filesystem or network I/O."
   @impl true
-  def prepare_upload(channel_id, [_ | _] = files, opts) do
+  def prepare_upload(channel_id, [_ | _] = files, _opts) do
     request_boundary(fn ->
-      with {:ok, parts} <- multipart_files(files),
-           {:ok, limit} <- upload_limit(opts) do
+      with {:ok, parts} <- multipart_files(files) do
         encoded = Req.Utils.encode_form_multipart([{:channel_id, channel_id} | parts])
         body = encoded.body |> Enum.to_list() |> IO.iodata_to_binary()
 
-        if byte_size(body) <= limit do
-          {:ok,
-           %{
-             channel_id: channel_id,
-             body: body,
-             content_type: encoded.content_type,
-             size_bytes: byte_size(body),
-             files:
-               Enum.map(files, fn file ->
-                 file |> Map.take([:filename, :content_type]) |> Map.put(:size_bytes, byte_size(file.body))
-               end)
-           }}
-        else
-          {:error, :upload_request_too_large}
-        end
+        {:ok,
+         %{
+           channel_id: channel_id,
+           body: body,
+           content_type: encoded.content_type,
+           size_bytes: byte_size(body),
+           files:
+             Enum.map(files, fn file ->
+               file |> Map.take([:filename, :content_type]) |> Map.put(:size_bytes, byte_size(file.body))
+             end)
+         }}
       end
     end)
   end
@@ -66,9 +61,7 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
   def upload_prepared(%{body: body, content_type: type, size_bytes: size, files: [_ | _] = files}, opts)
       when is_binary(body) and is_binary(type) and byte_size(body) == size do
     request_boundary(fn ->
-      with {:ok, limit} <- upload_limit(opts),
-           :ok <- check_request_size(size, limit),
-           {:ok, result} <- post_multipart(body, type, opts),
+      with {:ok, result} <- post_multipart(body, type, opts),
            :ok <- confirm_upload_batch(result, length(files)) do
         {:ok, result}
       end
@@ -76,9 +69,6 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
   end
 
   def upload_prepared(_prepared, _opts), do: {:error, :invalid_prepared_upload}
-
-  defp check_request_size(size, limit) when size <= limit, do: :ok
-  defp check_request_size(_size, _limit), do: {:error, :upload_request_too_large}
 
   defp materialize_files(files) do
     Enum.reduce_while(files, {:ok, []}, fn file, {:ok, acc} ->
@@ -108,18 +98,6 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
         error -> {:halt, error}
       end
     end)
-  end
-
-  defp upload_limit(opts) do
-    case Keyword.get(
-           opts,
-           :max_upload_request_size,
-           Application.get_env(:jido_chat_mattermost, :max_upload_request_size)
-         ) do
-      nil -> {:error, {:missing_configuration, :max_upload_request_size}}
-      limit when is_integer(limit) and limit > 0 -> {:ok, limit}
-      _ -> {:error, {:invalid_configuration, :max_upload_request_size}}
-    end
   end
 
   defp confirm_upload_batch(%{"file_infos" => [_ | _] = infos}, count) do
@@ -253,9 +231,6 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClient do
   defp failure_reason(reason) when is_atom(reason) and not is_nil(reason), do: reason
   defp failure_reason({:http_error, status}) when status in 100..599, do: {:http_error, status}
   defp failure_reason({status, _body}) when status in 100..599, do: {:http_error, status}
-
-  defp failure_reason({kind, key} = reason)
-       when kind in [:missing_configuration, :invalid_configuration] and key == :max_upload_request_size, do: reason
 
   defp failure_reason(_reason), do: :attachment_delivery_failed
 

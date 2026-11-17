@@ -15,18 +15,22 @@ implemented by Mattermost. The supporting immutable SDK revision is
 Consumers with a direct SDK override must use this revision or a compatible
 revision containing the same public contracts.
 
-`file_requirements/1` reads opts before application configuration and returns
-independent `max_file_size`, `max_files_per_post` (10) and
-`max_upload_request_size` values. Missing configuration is `:unresolved`;
-`:not_applicable` is available in the SDK contract for providers without a limit.
-Invalid configured limits return an error. No remote discovery occurs.
+`file_requirements/1` reads `max_file_size` from opts before application
+configuration and returns it with `max_files_per_post: 10` and
+`max_upload_request_size: :not_applicable`. The last field uses the existing SDK
+contract for a constraint the adapter does not impose; it is never `:unresolved`
+and requires no configuration. The former request-size option and application
+setting are ignored. Missing per-file configuration remains `:unresolved`;
+invalid per-file limits return an error. No remote discovery occurs. The pinned
+SDK already accepts this contract, so no SDK change is required.
 
 `prepare_upload/3` accepts materialized `FileUpload` candidates (`data` and
 `filename`), performs no file or network I/O, checks actual per-file sizes and
 encodes exactly the supplied candidate. The result contains `channel_id`,
 `body` (binary), `content_type`, `size_bytes` and ordered input `files` metadata.
-The explicit request ceiling includes the complete multipart body; it is never
-inferred from the per-file limit. An oversized candidate is rejected as a whole.
+The byte count includes the complete multipart body. No encoded-request ceiling
+is configured or inferred from the per-file limit; the supplied candidate is
+prepared as a whole.
 Prepared bodies contain file content: do not log or save them in handles.
 
 `upload_prepared/2` submits that representation once with retries disabled,
@@ -523,8 +527,8 @@ Old orchestration reports in restored handles are cleared after an edit.
 
 A convenience `send_file/3` can read a local path and perform one upload plus one
 post. `max_file_size` is mandatory for new file delivery and metadata-only
-`validate_files/2`; `max_upload_request_size` is additionally required by ReqClient.
-Custom transports own their exact request encoding and limits. Neither limit is
+`validate_files/2`. No encoded-request limit is required by ReqClient. Custom
+transports own their exact request encoding. Per-file configuration is not
 required to publish supplied uploaded references or to perform text-only edits.
 
 Uploads and publication contain transport exceptions/exits and normalize errors

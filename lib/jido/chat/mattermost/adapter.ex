@@ -219,16 +219,15 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
   # --- Send / Edit / Delete ---
 
-  @doc "Returns independently configured file, post-count and encoded-request limits without I/O."
+  @doc "Returns file and post-count limits without I/O; no encoded-request constraint applies."
   if {:file_requirements, 1} in Jido.Chat.Adapter.behaviour_info(:callbacks) do
     @impl true
   end
 
   @spec file_requirements(keyword()) :: {:ok, map()} | {:error, term()}
   def file_requirements(opts \\ []) do
-    with {:ok, file_limit} <- configured_limit(opts, :max_file_size),
-         {:ok, request_limit} <- configured_limit(opts, :max_upload_request_size) do
-      {:ok, %{max_file_size: file_limit, max_files_per_post: 10, max_upload_request_size: request_limit}}
+    with {:ok, file_limit} <- configured_limit(opts, :max_file_size) do
+      {:ok, %{max_file_size: file_limit, max_files_per_post: 10, max_upload_request_size: :not_applicable}}
     end
   end
 
@@ -408,7 +407,7 @@ defmodule Jido.Chat.Mattermost.Adapter do
 
   defp neutral_failure({kind, key} = reason)
        when kind in [:missing_configuration, :invalid_configuration] and
-              key in [:max_file_size, :max_upload_request_size],
+              key == :max_file_size,
        do: reason
 
   defp neutral_failure(_reason), do: :attachment_delivery_failed

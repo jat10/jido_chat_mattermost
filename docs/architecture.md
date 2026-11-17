@@ -146,9 +146,12 @@ without I/O; `upload_prepared/2` submits the same representation once. `ReqClien
 returns the encoded binary, content type, byte count and ordered input metadata.
 The host selects requests; provider-local encoding determines their exact size.
 
-`max_upload_request_size` is an explicit encoded HTTP body ceiling, independent
-of `max_file_size`. Missing or invalid request configuration fails before upload.
-Oversized candidates fail as a whole. Each successful request returns one unique
+`max_file_size` remains the required per-file ceiling. No encoded-request
+ceiling is configured or inferred: `file_requirements/1` reports the SDK's
+standard `max_upload_request_size: :not_applicable`. The former request-size
+option and application setting are ignored. Exact body measurement remains
+available to the host. Server/proxy rejections remain errors; the provider does
+not split or retry the candidate. Each successful request returns one unique
 confirmed server ID per input in order. Server post attachment membership and
 order are authoritative and can differ from upload order. Failed or malformed
 responses never manufacture identities or expose response bodies in upload or
@@ -193,9 +196,8 @@ advertised by `configurable_max_file_size: :native` in the adapter capability ma
 resolved from per-call options before application configuration. Set it to the
 server's `FileSettings.MaxFileSize`; it is not discovered automatically. This is
 required for single-file sends, multiple-file posts, and attachment edits.
-`max_upload_request_size` independently bounds the encoded request body;
-configure it from actual server/proxy limits. Text-only operations and supplied
-upload references do not require upload configuration. See the
+Text-only operations and supplied upload references do not require upload
+configuration. No request-size configuration is required. See the
 [README configuration example](../README.md#configuration).
 
 Call `Adapter.validate_files/2` before materialization to check declared sizes.

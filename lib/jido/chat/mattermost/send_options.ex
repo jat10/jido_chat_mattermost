@@ -2,7 +2,6 @@ defmodule Jido.Chat.Mattermost.SendOptions do
   @moduledoc "Options for sending a Mattermost post."
 
   defstruct uploaded_files: nil,
-            max_upload_request_size: nil,
             max_file_size: nil,
             thread_id: nil,
             token: nil,
@@ -11,7 +10,6 @@ defmodule Jido.Chat.Mattermost.SendOptions do
 
   @type t :: %__MODULE__{
           uploaded_files: term(),
-          max_upload_request_size: pos_integer() | nil,
           thread_id: String.t() | nil,
           max_file_size: pos_integer() | nil,
           token: String.t() | nil,
@@ -24,12 +22,6 @@ defmodule Jido.Chat.Mattermost.SendOptions do
   def new(opts \\ []) do
     %__MODULE__{
       uploaded_files: opts[:uploaded_files],
-      max_upload_request_size:
-        Keyword.get(
-          opts,
-          :max_upload_request_size,
-          Application.get_env(:jido_chat_mattermost, :max_upload_request_size)
-        ),
       thread_id: opts[:thread_id] || opts[:external_thread_id] || opts[:reply_to_id],
       max_file_size: Keyword.get(opts, :max_file_size, Application.get_env(:jido_chat_mattermost, :max_file_size)),
       token: opts[:token],
@@ -42,7 +34,6 @@ defmodule Jido.Chat.Mattermost.SendOptions do
   @spec transport_opts(t()) :: keyword()
   def transport_opts(%__MODULE__{} = o) do
     []
-    |> maybe_put(:max_upload_request_size, o.max_upload_request_size)
     |> maybe_put(:max_file_size, o.max_file_size)
     |> maybe_put(:thread_id, o.thread_id)
     |> maybe_put(:token, o.token)

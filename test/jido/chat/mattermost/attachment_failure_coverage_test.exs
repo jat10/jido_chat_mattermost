@@ -22,7 +22,7 @@ defmodule Jido.Chat.Mattermost.AttachmentFailureCoverageTest do
     for {input, expected} <- [
           {{:http_error, 503}, {:http_error, 503}},
           {%{reason: {429, "private-provider-body"}, token: "private-token"}, {:http_error, 429}},
-          {{:missing_configuration, :max_upload_request_size}, {:missing_configuration, :max_upload_request_size}},
+          {{:missing_configuration, :max_file_size}, {:missing_configuration, :max_file_size}},
           {{:invalid_configuration, :max_file_size}, {:invalid_configuration, :max_file_size}}
         ] do
       result(:upload_files, {:error, input})

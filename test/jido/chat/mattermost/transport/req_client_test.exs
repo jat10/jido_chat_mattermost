@@ -17,8 +17,7 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
     do: [
       url: @url,
       token: @token,
-      max_file_size: String.to_integer(System.get_env("MATTERMOST_MAX_FILE_SIZE", "307200")),
-      max_upload_request_size: String.to_integer(System.get_env("MATTERMOST_MAX_UPLOAD_REQUEST_SIZE", "307712"))
+      max_file_size: String.to_integer(System.get_env("MATTERMOST_MAX_FILE_SIZE", "307200"))
     ]
 
   test "invalid authentication is preserved across writes, uploads, downloads, and typing" do
@@ -403,8 +402,7 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
        opts: [
          url: "http://127.0.0.1:#{port}",
          token: System.get_env("MATTERMOST_TOKEN", ""),
-         max_file_size: 1024,
-         max_upload_request_size: 2048
+         max_file_size: 1024
        ]}
     end
 

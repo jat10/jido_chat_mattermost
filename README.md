@@ -24,9 +24,8 @@ end
 ## Configuration
 
 Token and base URL can be provided per-call via opts or set globally.
-File uploads require `max_upload_request_size` for the exact encoded body and
-`max_file_size` for individual files. Both are independently configured.
-The per-file limit is a positive integer in bytes matching
+File uploads require `max_file_size` for individual files.
+This limit is a positive integer in bytes matching
 your Mattermost server's `FileSettings.MaxFileSize`. This applies to single-file
 sends, multiple-file posts, and attachment edits. Text-only sends and edits do
 not require it.
@@ -38,8 +37,7 @@ For an application that uploads files, configure:
 config :jido_chat_mattermost,
   url: "https://mattermost.yourcompany.com",
   token: System.get_env("MATTERMOST_BOT_TOKEN"),
-  max_file_size: System.fetch_env!("MATTERMOST_MAX_FILE_SIZE") |> String.to_integer(),
-  max_upload_request_size: System.fetch_env!("MATTERMOST_MAX_UPLOAD_REQUEST_SIZE") |> String.to_integer()
+  max_file_size: System.fetch_env!("MATTERMOST_MAX_FILE_SIZE") |> String.to_integer()
 ```
 
 Set `MATTERMOST_MAX_FILE_SIZE` in your application's environment to the server's
@@ -80,7 +78,6 @@ alias Jido.Chat.Mattermost.Adapter
     %{path: "/tmp/report.pdf", filename: "report.pdf", media_type: "application/pdf"},
     token: "my-token",
     max_file_size: System.fetch_env!("MATTERMOST_MAX_FILE_SIZE") |> String.to_integer(),
-    max_upload_request_size: System.fetch_env!("MATTERMOST_MAX_UPLOAD_REQUEST_SIZE") |> String.to_integer(),
     caption: "Latest report"
   )
 
@@ -158,13 +155,15 @@ chooses continuation threads, retries or applies an attachment failure policy.
 `attachment_failure_policy` is retired and returns an explicit unsupported-option
 error; migrate stored handle options as well as new calls.
 
-Configure **independent** positive integer byte limits: `max_file_size` for each
-file and `max_upload_request_size` for the complete encoded HTTP body. Derive the
-latter from your actual server/proxy configuration; the library does not infer it
-from the per-file limit or discover remote settings. Missing request configuration
-fails before HTTP. Text-only operations and publication using already uploaded
-references do not require upload limits. A post accepts at most ten files;
+Configure `max_file_size` as a positive integer byte limit for each file. The
+adapter does not discover remote settings. A post accepts at most ten files;
 an excessive selection or any invalid file rejects the complete operation.
+There is no adapter-configured encoded-request ceiling. The SDK requirements
+field `max_upload_request_size` is always `:not_applicable`; the former option
+and application setting are ignored. Multipart preparation still measures the
+complete body exactly, and server/proxy rejections remain upload errors.
+Text-only operations and publication using already uploaded references do not
+require upload limits.
 
 Custom transports implement `upload_files/3` for one explicit upload request,
 returning ordered `file_infos` with one unique server ID per input. Optional

@@ -29,26 +29,40 @@ defmodule Jido.Chat.Mattermost.FileValidationTest do
     refute_received {:transport_call, _, _}
   end
 
-  test "provider requirements expose independent configuration without I/O" do
-    assert {:ok, %{max_file_size: 123, max_files_per_post: 10, max_upload_request_size: :unresolved}} =
-             Jido.Chat.Mattermost.Adapter.file_requirements(max_file_size: 123, max_upload_request_size: nil)
+  test "provider requirements expose file limits without an encoded-request constraint or I/O" do
+    alias Jido.Chat.Mattermost.Adapter
 
-    assert {:ok, %{max_file_size: :unresolved, max_upload_request_size: 456}} =
-             Jido.Chat.Mattermost.Adapter.file_requirements(max_file_size: nil, max_upload_request_size: 456)
+    assert {:ok, %{max_file_size: 123, max_files_per_post: 10, max_upload_request_size: :not_applicable}} =
+             Jido.Chat.Adapter.file_requirements(Adapter, max_file_size: 123)
 
-    for key <- [:max_file_size, :max_upload_request_size] do
-      assert {:error, {:invalid_configuration, ^key}} = Jido.Chat.Mattermost.Adapter.file_requirements([{key, 0}])
+    assert {:ok, %{max_file_size: :unresolved, max_files_per_post: 10, max_upload_request_size: :not_applicable}} =
+             Jido.Chat.Adapter.file_requirements(Adapter, max_file_size: nil)
+
+    for limit <- [0, -1, "10"] do
+      assert {:error, {:invalid_configuration, :max_file_size}} = Adapter.file_requirements(max_file_size: limit)
     end
   end
 
   test "provider prepares bytes without credentials or reading paths" do
-    opts = [max_file_size: 100, max_upload_request_size: 2048]
+    opts = [max_file_size: 100]
 
     assert {:ok, prepared} =
              Jido.Chat.Mattermost.Adapter.prepare_upload("room", [%{data: "bytes", filename: "file.txt"}], opts)
 
     assert prepared.size_bytes == byte_size(prepared.body)
     assert prepared.body =~ "bytes"
+
+    for {limit, reason} <- [
+          {nil, :missing_configuration},
+          {0, :invalid_configuration},
+          {-1, :invalid_configuration},
+          {"100", :invalid_configuration}
+        ] do
+      assert {:error, {^reason, :max_file_size}} =
+               Jido.Chat.Mattermost.Adapter.prepare_upload("room", [%{data: "bytes", filename: "file.txt"}],
+                 max_file_size: limit
+               )
+    end
 
     assert {:error, :file_not_materialized} =
              Jido.Chat.Mattermost.Adapter.prepare_upload(
@@ -68,13 +82,13 @@ defmodule Jido.Chat.Mattermost.FileValidationTest do
   test "provider upload primitive confirms complete identities before returning references" do
     alias Jido.Chat.Mattermost.Test.RecordingTransport
 
-    prepared = %{
-      channel_id: "room",
-      body: "encoded",
-      content_type: "multipart/form-data; boundary=x",
-      size_bytes: 7,
-      files: [%{filename: "input.txt", content_type: "text/plain", size_bytes: 2}]
-    }
+    assert {:ok, prepared} =
+             Jido.Chat.Adapter.prepare_upload(
+               Jido.Chat.Mattermost.Adapter,
+               "room",
+               [%{data: "ok", filename: "input.txt", media_type: "text/plain"}],
+               max_file_size: 2
+             )
 
     opts = [transport: RecordingTransport]
 
@@ -82,14 +96,16 @@ defmodule Jido.Chat.Mattermost.FileValidationTest do
       Process.put({RecordingTransport, :upload_prepared}, result)
       assert {:error, _} = Jido.Chat.Mattermost.Adapter.upload_prepared(prepared, opts)
       assert_received {:transport_call, :upload_prepared, [^prepared, _]}
+      refute_received {:transport_call, _, _}
     end
 
     Process.put({RecordingTransport, :upload_prepared}, {:ok, %{"file_infos" => [%{"id" => "provider-id"}]}})
 
     assert {:ok, %{files: [%{id: "provider-id", filename: "input.txt", size_bytes: 2}]}} =
-             Jido.Chat.Mattermost.Adapter.upload_prepared(prepared, opts)
+             Jido.Chat.Adapter.upload_prepared(Jido.Chat.Mattermost.Adapter, prepared, opts)
 
     assert_received {:transport_call, :upload_prepared, [^prepared, _]}
+    refute_received {:transport_call, _, _}
     assert {:error, :invalid_prepared_upload} = Jido.Chat.Mattermost.Adapter.upload_prepared(%{}, opts)
     refute_received {:transport_call, _, _}
   end
