@@ -5,46 +5,33 @@ defmodule Jido.Chat.Mattermost.Transport do
   Implement this behaviour to swap out the real HTTP client with a test double
   without hitting a live Mattermost server.
 
-  With `attachment_failure_policy: :continue | :abort`, upload and publication
-  callbacks return transport-neutral failure reasons: a non-nil atom (such as
-  `:timeout` or `:econnrefused`) or `{:http_error, status}` for HTTP statuses
-  100..599. Use `:transport_exception` for raised exceptions, `:transport_exit`
-  for exits, and `:attachment_delivery_failed` for unclassified failures.
-  Never include response bodies, credentials, or HTTP-library exception structs
-  in policy-mode failures. Partial upload results retain their confirmed prefix
-  and put the neutral reason in `partial_upload.reason`.
-
-  The adapter forwards the normalized policy to upload and publication callbacks.
-  Calls without an explicit policy retain their legacy error results. To sanitize
-  structured reports from those calls, the adapter also accepts `{status, body}`
-  and generic `%{reason: reason}` envelopes, recursively keeping only the neutral
-  category and discarding every other field. Custom transports can use these
-  envelopes without coupling the adapter to their exception types.
+  Upload preparation encodes one host-selected candidate without I/O. Upload
+  submission makes one HTTP attempt using those exact bytes. No callback selects
+  batches, applies failure policy, retries, creates continuations or returns
+  delivery plans. Upload and publication failures are neutral atoms or
+  `{:http_error, status}`, excluding credentials, response bodies and exceptions.
+  An unconfirmed upload/publication may have affected the server; hosts own
+  reconciliation and must not assume an error makes retry safe.
   """
 
   @callback send_message(channel_id :: String.t(), text :: String.t(), opts :: keyword()) ::
               {:ok, map()} | {:error, term()}
 
   @doc """
-  Uploads files, returning one `file_infos` entry per input in the same order.
-
-  Each entry must contain a unique server file ID. Optional server details take
-  precedence over the corresponding input's metadata. Preserve request order so
-  sparse responses can be correlated without relying on filenames being unique.
-
-  The adapter supplies the files for one post and `opts[:max_file_size]` in bytes.
-  The transport owns encoded request sizing and may split them into multiple HTTP
-  requests. Return success only after all uploads are confirmed; stop and return
-  an error if a request fails or returns incomplete results. Uploaded files may
-  remain stored after a later request fails. Do not create posts here.
-
-  With `attachment_failure_policy: :continue | :abort`, retain confirmed earlier
-  batches in `{:error, {:partial_upload, %{reason: reason, uploaded: result}}}`.
-  `result.file_infos` contains only the confirmed input prefix, in order. The
-  adapter decides whether to publish it; never retry a failed batch here.
+  Uploads exactly one supplied candidate. May materialize paths for convenience,
+  but must never split it into multiple requests. Returns one unique server ID
+  per input in `file_infos`, in input order, only after complete confirmation.
+  Encoded request limits are independent of individual file size limits.
   """
-  @callback upload_files(channel_id :: String.t(), files :: [map()], opts :: keyword()) ::
-              {:ok, map()} | {:error, term()}
+  @callback upload_files(String.t(), [map()], keyword()) :: {:ok, map()} | {:error, term()}
+
+  @doc "Pure exact encoding of materialized files, with no filesystem/network I/O."
+  @callback prepare_upload(String.t(), [map()], keyword()) :: {:ok, map()} | {:error, term()}
+
+  @doc "Uploads the exact prepared bytes once, returning ordered file_infos."
+  @callback upload_prepared(map(), keyword()) :: {:ok, map()} | {:error, term()}
+
+  @optional_callbacks prepare_upload: 3, upload_prepared: 2
 
   @callback download_file(file_id :: String.t(), opts :: keyword()) ::
               {:ok, binary()} | {:error, term()}

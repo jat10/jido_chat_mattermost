@@ -55,7 +55,7 @@ defmodule Jido.Chat.Mattermost.MixProject do
 
   defp deps do
     [
-      {:jido_chat, github: "agentjido/jido_chat", branch: "main"},
+      {:jido_chat, github: "jat10/jido_chat", ref: "f17679337a9975bee43b9540cb08ac5cfc12b86a"},
       {:req, "~> 0.5"},
       {:fresh, github: "www-zaq-ai/fresh", branch: "main"},
       {:jason, "~> 1.4"},

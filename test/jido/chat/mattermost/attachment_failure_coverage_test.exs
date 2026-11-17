@@ -18,77 +18,53 @@ defmodule Jido.Chat.Mattermost.AttachmentFailureCoverageTest do
     assert :ok = Jido.Chat.Adapter.validate_capabilities(Adapter)
   end
 
-  test "continue skips a failed continuation upload and retains the confirmed first post" do
-    ids = Enum.map(1..10, &"file-#{&1}")
+  test "provider error envelopes retain only neutral reasons and configuration keys" do
+    for {input, expected} <- [
+          {{:http_error, 503}, {:http_error, 503}},
+          {%{reason: {429, "private-provider-body"}, token: "private-token"}, {:http_error, 429}},
+          {{:missing_configuration, :max_upload_request_size}, {:missing_configuration, :max_upload_request_size}},
+          {{:invalid_configuration, :max_file_size}, {:invalid_configuration, :max_file_size}}
+        ] do
+      result(:upload_files, {:error, input})
+      assert {:error, ^expected} = post([file()])
+      assert_received {:transport_call, :upload_files, _}
+      refute_received {:transport_call, _, _}
+    end
+  end
 
-    result(:upload_files, fn ->
-      case Process.get(:upload_count, 0) do
-        0 ->
-          Process.put(:upload_count, 1)
-          {:ok, %{"file_infos" => Enum.map(ids, &%{"id" => &1})}}
+  test "uploaded references and new file sources cannot be mixed" do
+    assert {:error, :conflicting_file_sources} = post([file()], uploaded_files: [%{id: "file"}])
 
-        1 ->
-          {:error, :timeout}
-      end
-    end)
+    assert {:error, :conflicting_file_sources} =
+             Adapter.edit_message(
+               "room",
+               "post",
+               "answer",
+               Keyword.merge(opts(), files: [file()], uploaded_files: [%{id: "file"}])
+             )
 
-    result(:send_message, {:ok, %{"id" => "post", "file_ids" => ids}})
-    files = Enum.map(1..11, &file("#{&1}.txt"))
-
-    assert {:ok, response} = post(files, attachment_failure_policy: :continue)
-    report = response.metadata.delivery_report
-    assert report.confirmation == :partial
-    assert [%{message_id: "post", delivery_part_index: 0}] = report.messages
-    assert [%{filename: "11.txt", reason: :timeout, stage: :upload, delivery: :not_sent}] = report.failed_files
-    assert Enum.map(report.uploaded_files, & &1.file_id) == ids
-    assert_received {:transport_call, :upload_files, ["room", first, _]}
-    assert length(first) == 10
-    assert_received {:transport_call, :upload_files, ["room", [%{filename: "11.txt"}], _]}
-    assert_received {:transport_call, :send_message, ["room", "Answer", _]}
     refute_received {:transport_call, _, _}
   end
 
   for {fault, reason} <- [exception: :transport_exception, exit: :transport_exit] do
     @fault fault
     @reason reason
-
-    test "strict uploads convert #{@fault} into a failure without publication" do
-      result(:upload_files, fault(@fault))
-
-      assert {:error, {:attachment_delivery_failed, report}} =
-               post([file()], attachment_failure_policy: :abort)
-
-      assert report.delivery == :not_sent
-      assert report.messages == []
-      assert report.uploaded_files == []
-      assert [%{filename: "file.txt", reason: @reason, stage: :upload, delivery: :not_sent}] = report.failed_files
-      assert_received {:transport_call, :upload_files, _}
-      refute_received {:transport_call, _, _}
-    end
-
-    test "policy publication #{@fault} reports the existing upload as unconfirmed without retry" do
-      result(:send_message, fault(@fault))
-
-      assert {:error, {:attachment_delivery_failed, report}} =
-               post([file()], attachment_failure_policy: :continue)
-
-      assert report.delivery == :unconfirmed
-      assert report.messages == []
-      assert [%{filename: "file.txt", file_id: "file"}] = report.uploaded_files
-      assert [%{reason: @reason, stage: :transport, delivery: :unconfirmed}] = report.failed_files
-      assert_received {:transport_call, :upload_files, _}
-      assert_received {:transport_call, :send_message, _}
-      refute_received {:transport_call, _, _}
-    end
-
-    test "legacy upload #{@fault} returns its category without publishing" do
+    test "upload #{@fault} returns its neutral category without publication" do
       result(:upload_files, fault(@fault))
       assert {:error, @reason} = Adapter.send_file("room", file(), opts())
       assert_received {:transport_call, :upload_files, _}
       refute_received {:transport_call, _, _}
     end
 
-    test "legacy multi-file edit #{@fault} never creates a replacement post" do
+    test "publication #{@fault} never retries an upload or creates a fallback post" do
+      result(:send_message, fault(@fault))
+      assert {:error, @reason} = post([file()])
+      assert_received {:transport_call, :upload_files, _}
+      assert_received {:transport_call, :send_message, _}
+      refute_received {:transport_call, _, _}
+    end
+
+    test "multi-file edit #{@fault} never creates a replacement post" do
       result(:edit_message, fault(@fault))
       result(:upload_files, {:ok, %{"file_infos" => [%{"id" => "one"}, %{"id" => "two"}]}})
 
@@ -101,52 +77,26 @@ defmodule Jido.Chat.Mattermost.AttachmentFailureCoverageTest do
     end
   end
 
-  test "empty partial upload prefixes retain the original failure without publication" do
-    result(:upload_files, {:error, {:partial_upload, %{reason: :timeout, uploaded: %{"file_infos" => []}}}})
+  test "a retired partial upload result cannot publish an inferred prefix" do
+    result(
+      :upload_files,
+      {:error, {:partial_upload, %{reason: :timeout, uploaded: %{"file_infos" => [%{"id" => "file"}]}}}}
+    )
 
-    assert {:error, {:attachment_delivery_failed, report}} = post([file()], attachment_failure_policy: :abort)
-    assert report.delivery == :not_sent
-    assert report.uploaded_files == []
-    assert [%{reason: :timeout, stage: :upload}] = report.failed_files
+    assert {:error, :attachment_delivery_failed} = post([file()])
     assert_received {:transport_call, :upload_files, _}
     refute_received {:transport_call, _, _}
   end
 
-  test "invalid partial upload prefixes are rejected as unconfirmed before publication" do
-    for infos <- [
-          [%{"id" => "one"}, %{"id" => "extra"}],
-          [%{"name" => "missing-id.txt"}],
-          [%{"id" => ""}]
+  test "an unusable sibling rejects the entire selection without text fallback" do
+    for invalid <- [
+          %FileUpload{data: "bytes"},
+          %FileUpload{filename: "remote.txt", url: "https://example.com/file.txt"}
         ] do
-      result(:upload_files, {:error, {:partial_upload, %{reason: :timeout, uploaded: %{"file_infos" => infos}}}})
-
-      assert {:error, {:attachment_delivery_failed, report}} = post([file()], attachment_failure_policy: :abort)
-      assert report.delivery == :not_sent
-      assert report.uploaded_files == []
-      assert [%{reason: :unconfirmed_upload, stage: :upload}] = report.failed_files
-      assert_received {:transport_call, :upload_files, _}
+      assert {:error, reason} = post([file(), invalid])
+      assert reason in [:missing_filename, :unsupported_remote_url]
       refute_received {:transport_call, _, _}
     end
-  end
-
-  test "continue rejects unusable file sources individually and publishes the valid file once" do
-    files = [
-      %FileUpload{data: "bytes"},
-      %FileUpload{filename: "remote.txt", url: "https://example.com/file.txt"},
-      file()
-    ]
-
-    assert {:ok, response} = post(files, attachment_failure_policy: :continue)
-    assert response.metadata.file_ids == ["file"]
-
-    assert [
-             %{reason: :missing_filename, delivery: :not_sent},
-             %{filename: "remote.txt", reason: :unsupported_remote_url, delivery: :not_sent}
-           ] = response.metadata.delivery_report.failed_files
-
-    assert_received {:transport_call, :upload_files, ["room", [%{filename: "file.txt"}], _]}
-    assert_received {:transport_call, :send_message, _}
-    refute_received {:transport_call, _, _}
   end
 
   test "legacy selections containing only oversized files fail before transport dispatch" do
@@ -162,12 +112,19 @@ defmodule Jido.Chat.Mattermost.AttachmentFailureCoverageTest do
     refute_received {:transport_call, _, _}
   end
 
-  test "unknown provider errors are redacted in policy reports" do
-    result(:upload_files, {:error, {:provider_error, "private detail"}})
+  test "unknown provider errors are always redacted" do
+    for callback <- [:upload_files, :send_message] do
+      result(callback, {:error, {:provider_error, "private detail"}})
+      assert {:error, :attachment_delivery_failed} = post([file()])
 
-    assert {:error, {:attachment_delivery_failed, report}} = post([file()], attachment_failure_policy: :abort)
-    assert [%{reason: :attachment_delivery_failed}] = report.failed_files
-    refute inspect(report) =~ "private detail"
+      result(
+        callback,
+        if(callback == :upload_files,
+          do: {:ok, %{"file_infos" => [%{"id" => "file"}]}},
+          else: {:ok, %{"id" => "post", "file_ids" => ["file"]}}
+        )
+      )
+    end
   end
 
   test "alternate transport upload response shapes retain confirmed server details" do

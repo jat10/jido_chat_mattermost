@@ -5,6 +5,8 @@ defmodule Jido.Chat.Mattermost.Test.RecordingTransport do
   for {name, arity} <- [
         send_message: 3,
         upload_files: 3,
+        prepare_upload: 3,
+        upload_prepared: 2,
         download_file: 2,
         edit_message: 4,
         delete_message: 3,

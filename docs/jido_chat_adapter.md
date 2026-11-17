@@ -6,6 +6,56 @@ callbacks.
 
 Source of truth: `deps/jido_chat/lib/jido/chat/adapter.ex`
 
+## File operation contract
+
+The SDK revision pinned in `mix.exs` and `mix.lock` provides optional
+`file_requirements/1`, `prepare_upload/3` and `upload_prepared/2` callbacks
+implemented by Mattermost. The supporting immutable SDK revision is
+[`f176793`](https://github.com/jat10/jido_chat/commit/f17679337a9975bee43b9540cb08ac5cfc12b86a).
+Consumers with a direct SDK override must use this revision or a compatible
+revision containing the same public contracts.
+
+`file_requirements/1` reads opts before application configuration and returns
+independent `max_file_size`, `max_files_per_post` (10) and
+`max_upload_request_size` values. Missing configuration is `:unresolved`;
+`:not_applicable` is available in the SDK contract for providers without a limit.
+Invalid configured limits return an error. No remote discovery occurs.
+
+`prepare_upload/3` accepts materialized `FileUpload` candidates (`data` and
+`filename`), performs no file or network I/O, checks actual per-file sizes and
+encodes exactly the supplied candidate. The result contains `channel_id`,
+`body` (binary), `content_type`, `size_bytes` and ordered input `files` metadata.
+The explicit request ceiling includes the complete multipart body; it is never
+inferred from the per-file limit. An oversized candidate is rejected as a whole.
+Prepared bodies contain file content: do not log or save them in handles.
+
+`upload_prepared/2` submits that representation once with retries disabled,
+returning `%{files: [%{id: server_id, filename: name, media_type: type,
+size_bytes: size}]}` only after complete unique server identities are confirmed.
+The host passes those references through existing post/edit options:
+
+```elixir
+{:ok, requirements} = Jido.Chat.Adapter.file_requirements(Adapter, opts)
+{:ok, prepared} = Jido.Chat.Adapter.prepare_upload(Adapter, room, candidates, opts)
+{:ok, uploaded} = Jido.Chat.Adapter.upload_prepared(Adapter, prepared, opts)
+{:ok, sent} = ChannelRef.post(channel, "Caption", uploaded_files: uploaded.files)
+{:ok, edited} = SentMessage.edit(sent, "Updated", uploaded_files: uploaded.files)
+```
+
+Adapters explicitly declare `uploaded_files: :native` (backed by `post_message/3`);
+reference edits also require `edit_attachments: :native`. The SDK rejects unsupported
+reference publication before a text fallback can discard attachments. Uploaded
+references apply to the current invocation and are removed from retained handle
+options, including old restored defaults.
+
+The host resolves unknown limits and selects candidates. Post/edit consumes
+validated references without reupload; mixing references with new files fails.
+Malformed references and missing provider identity cannot confirm delivery.
+A response must confirm a nonempty message ID and the complete attachment set;
+its order controls the message snapshot. An edit must confirm the requested post
+ID, so a different returned ID cannot redirect the handle. Input identities alone
+never establish publication.
+
 ---
 
 ## What is `Jido.Chat.Adapter`?
@@ -454,116 +504,33 @@ Text-only edit responses publish an explicit `metadata.attachments` list so the
 SDK refreshes its attachment list, including clearing it after external removal.
 An absent attachment snapshot leaves the SDK's existing fallback behavior intact.
 
-### Multiple-file posts and edits
+### Single-post file creation and editing
 
-The adapter declares `post_message: :native` and `multi_file: :native`.
-It also declares `attachment_failure_policy: :native`, independently of message
-and attachment editing. Existing send, post and attachment-edit callbacks accept
-`attachment_failure_policy: :continue | :abort`. Omitting it retains the legacy
-delivery behavior described below.
+`post_message` and `multi_file` are native. New files use a single explicit
+transport upload followed by one post or edit. Any preflight/upload failure
+prevents publication; there is no omission, fallback text, fan-out or retry.
+More than ten attachments fail before transport calls. `attachment_failure_policy`
+is retired and rejected explicitly, including on text-only operations and old
+restored handles. Host delivery planning belongs outside this adapter.
 
-Policies are normalized (`"abort"`/`"continue"` become atoms) and validated on
-send, post, and edit routes regardless of attachment count. Unknown policies fail
-before transport calls. Text-only sends, posts, and edits validate and forward the
-policy without uploading, requiring `max_file_size`, or generating attachment
-failure reports. Omitted policies preserve ordinary returned transport errors;
-file delivery contains transport exceptions/exits as `:transport_exception` or
-`:transport_exit` for both single-file and multiple-file operations.
+Each transport upload returns one unique confirmed file ID per input in request
+order. Sparse upload details inherit only the corresponding input metadata.
+Publication reconciles details by matching IDs; server membership and order take
+precedence. Text-only edits preserve, replace or clear their snapshots according
+to server facts, including explicit empty lists. `files: []` retains attachments;
+`uploaded_files: []` explicitly replaces the post's attachments with an empty set.
+Old orchestration reports in restored handles are cleared after an edit.
 
-With `:abort`, every planned file upload completes before the first post or update;
-any preflight/upload failure returns an error without final publication. With
-`:continue`, usable uploads are published and failures are reported; an entirely
-failed file selection publishes text once. Successful uploads are reused within
-the invocation. No public upload/publish handoff or retry is involved.
+A convenience `send_file/3` can read a local path and perform one upload plus one
+post. `max_file_size` is mandatory for new file delivery and metadata-only
+`validate_files/2`; `max_upload_request_size` is additionally required by ReqClient.
+Custom transports own their exact request encoding and limits. Neither limit is
+required to publish supplied uploaded references or to perform text-only edits.
 
-Policy-mode delivery reports additionally retain `uploaded_files`, separate from
-confirmed `messages`. Failures before publication return
-`{:error, {:attachment_delivery_failed, report}}` with `delivery: :not_sent`;
-uncertain publication uses `delivery: :unconfirmed`. Later publication failure can
-leave earlier confirmed posts, reported as a partial success. Strict mode does not
-make multiple post publication atomic, and orphaned uploads may remain.
-When strict upload preparation stops, later groups are reported as
-`reason: :not_attempted`, `stage: :upload`, `delivery: :not_sent`.
-When strict preflight rejects a selection, valid siblings receive the same
-unattempted outcome, while rejected files retain their individual reasons.
-Unconfirmed first-publication reports retain the normalized publication error in
-`reason`, including when continue mode publishes text after all uploads fail.
-Use `Postable.text("Caption", files: uploads)` with `Thread.post/3` or
-`ChannelRef.post/3` to attach multiple files to one post, or with
-`SentMessage.edit/3` to replace the attachments on the existing post.
-An empty upload list performs a text-only edit; it does not remove attachments.
-
-**Breaking migration:** existing single-file callers must now configure
-`max_file_size`, and custom transports must replace `upload_file/3` with
-`upload_files/3`. There is no fallback to the old callback. See the
-[README migration guide](../README.md#file-upload-migration-breaking-changes)
-for configuration examples and the transport migration contract.
-
-File delivery requires a positive integer `max_file_size` in bytes, supplied in per-call options or
-`config :jido_chat_mattermost, max_file_size: ...`. Set it to the server's
-`FileSettings.MaxFileSize`. Missing or invalid configuration returns
-`{:error, {:missing_configuration | :invalid_configuration, :max_file_size}}`
-before uploading; text-only sends and edits do not require this option.
-
-The adapter checks actual byte/file sizes before uploading and partitions valid
-files into posts of at most ten attachments. Oversized files are omitted and
-reported individually; an entirely rejected selection returns an error. Other
-invalid file sources fail preflight before any upload.
-
-The adapter calls `Transport.upload_files/3` once per post's attachment group.
-Each transport owns its request encoding, sizing, and HTTP batching. `ReqClient`
-measures its encoded multipart bodies, including headers, and plans all requests
-before uploading, fitting the configured limit plus Mattermost v10's 512-byte
-multipart allowance. Large valid files can upload separately while their IDs
-are attached to the same post. Custom transports must implement this callback
-using their own encoding rules; the adapter does not call Req's sizing helper.
-The callback returns success only after every batch is confirmed and stops on
-the first HTTP failure or incomplete upload response. Its combined `file_infos`
-response must contain one unique server file ID per input, in request order,
-so per-upload fallback metadata remains associated with the correct file.
-For a supplied failure policy, a later failed HTTP batch returns the confirmed
-input prefix as `{:error, {:partial_upload, %{reason: reason, uploaded: result}}}`.
-Only earlier fully confirmed batches appear in `result.file_infos`, in input
-order. The adapter can publish that prefix in continue mode without reuploading;
-strict mode reports it without publication. No failed HTTP batch is retried.
-
-The first post contains the supplied text. Continuations contain
-`Additional files (2/2).` (with the actual indices) and reply under the first
-post, or under the existing thread root. For an attachment edit, the first part
-updates the existing message and subsequent parts become thread replies.
-An explicit server `root_id: ""` confirms a root post: continuations reply under
-that post ID, even when saved options contain a different thread ID. Nonempty
-server roots take precedence; saved thread options are used only when the server
-omits root information. Delivery reports use the same routing decision.
-
-The SDK still returns one `SentMessage`, bound to the first confirmed post. When
-multiple posts or rejected/pending files are involved, its response metadata has
-`delivery_report: %{confirmation: :confirmed | :partial, messages: [...],
-failed_files: [...]}`. Each confirmed message includes its `message_id`, `body`,
-`thread_id`, `action`, `confirmation`, `delivery_part_index`, and attachment
-`metadata`. Consumers must record these as separate messages. Ordinary successful
-single-post sends retain their existing response shape.
-
-A later upload/post failure stops delivery. The report preserves confirmed posts
-and marks files in the failed part as unconfirmed and later files as not attempted.
-A first-part failure returns an error. No automatic retries occur; orphaned uploads
-can remain stored after failures. Per-file rejections include filename, actual
-size, configured limit, and reason.
-
-Structured `failed_files` entries use neutral atom reasons or `{:http_error, status}`,
-including upload failures and failed or pending publication parts. They retain
-per-file stage and delivery certainty without raw response bodies or transport
-exception structs. Legacy top-level `{:error, reason}` results keep their original
-internal reason; this normalization applies only to structured delivery reports.
-In policy mode, transports normalize their own library-specific failures before
-returning them: non-nil atoms, `{:http_error, status}`, `:transport_exception`,
-`:transport_exit`, or `:attachment_delivery_failed` for unknown failures. The
-adapter also sanitizes legacy HTTP tuples and generic `%{reason: reason}`
-envelopes without depending on concrete exception types. See the
-`Jido.Chat.Mattermost.Transport` contract.
-Upload failures have `stage: :upload`; entries without a more precise stage
-default to `:transport`.
-
-Server configuration can change after preflight. HTTP failures still propagate.
-Metadata contains ordered `file_ids`, `media`, and attachment snapshots; singular
-metadata fields describe the first file for compatibility.
+Uploads and publication contain transport exceptions/exits and normalize errors
+to safe atoms or `{:http_error, status}`. Configuration errors retain their setting
+name; unknown transport failures become `:attachment_delivery_failed`. Errors do
+not carry raw HTTP bodies or exception structs. Missing or malformed responses
+are unconfirmed; remote effects and orphaned uploads may remain. The host owns
+reconciliation and retry decisions. See the [migration guide](../README.md#file-upload-migration-breaking-changes)
+and [coverage handoff](delivery-migration.md).

@@ -17,7 +17,8 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
     do: [
       url: @url,
       token: @token,
-      max_file_size: String.to_integer(System.get_env("MATTERMOST_MAX_FILE_SIZE", "307200"))
+      max_file_size: String.to_integer(System.get_env("MATTERMOST_MAX_FILE_SIZE", "307200")),
+      max_upload_request_size: String.to_integer(System.get_env("MATTERMOST_MAX_UPLOAD_REQUEST_SIZE", "307712"))
     ]
 
   test "invalid authentication is preserved across writes, uploads, downloads, and typing" do
@@ -33,31 +34,27 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
           {:add_reaction, [post["id"], "thumbsup"]},
           {:send_typing, [@channel_id]}
         ] do
-      assert {:error, {401, body}} = apply(ReqClient, callback, args ++ [invalid_opts])
-      assert is_map(body) or is_binary(body)
+      case apply(ReqClient, callback, args ++ [invalid_opts]) do
+        {:error, {:http_error, 401}} when callback in [:send_message, :edit_message, :upload_files] -> :ok
+        {:error, {401, body}} -> assert is_map(body) or is_binary(body)
+      end
     end
 
     assert {:ok, unchanged} = ReqClient.fetch_post(post["id"], opts())
     assert unchanged["message"] == "authentication failure target"
   end
 
-  test "policy HTTP failures are neutral for uploads and final publication" do
-    post = create_post("policy authentication failure target")
+  test "HTTP failures are neutral for uploads and final publication" do
+    post = create_post("authentication failure target")
     invalid_opts = Keyword.put(opts(), :token, Base.encode16(:crypto.strong_rand_bytes(24)))
+    assert {:error, {:http_error, 401}} = ReqClient.send_message(@channel_id, "unauthorized", invalid_opts)
+    assert {:error, {:http_error, 401}} = ReqClient.edit_message(@channel_id, post["id"], "unauthorized", invalid_opts)
 
-    for policy <- [:abort, :continue] do
-      policy_opts = Keyword.put(invalid_opts, :attachment_failure_policy, policy)
-      assert {:error, {:http_error, 401}} = ReqClient.send_message(@channel_id, "unauthorized", policy_opts)
+    assert {:error, {:http_error, 401}} =
+             ReqClient.upload_files(@channel_id, [%{body: "bytes", filename: "unauthorized.txt"}], invalid_opts)
 
-      assert {:error, {:http_error, 401}} =
-               ReqClient.edit_message(@channel_id, post["id"], "unauthorized", policy_opts)
-
-      assert {:error, {:partial_upload, %{reason: {:http_error, 401}, uploaded: %{"file_infos" => []}}}} =
-               ReqClient.upload_files(@channel_id, [%{body: "bytes", filename: "unauthorized.txt"}], policy_opts)
-
-      assert {:ok, unchanged} = ReqClient.fetch_post(post["id"], opts())
-      assert unchanged["message"] == "policy authentication failure target"
-    end
+    assert {:ok, unchanged} = ReqClient.fetch_post(post["id"], opts())
+    assert unchanged["message"] == "authentication failure target"
   end
 
   test "downloading a nonexistent file preserves its HTTP error" do
@@ -84,8 +81,12 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
           {:upload_files, [@channel_id, [%{body: "one", filename: "one.txt"}, %{body: "two", filename: "two.txt"}]]},
           {:download_file, [@file_id]}
         ] do
-      assert {:error, %Req.TransportError{reason: :econnrefused}} =
-               apply(ReqClient, callback, args ++ [unavailable_opts])
+      if callback in [:send_message, :edit_message, :upload_files] do
+        assert {:error, :econnrefused} = apply(ReqClient, callback, args ++ [unavailable_opts])
+      else
+        assert {:error, %Req.TransportError{reason: :econnrefused}} =
+                 apply(ReqClient, callback, args ++ [unavailable_opts])
+      end
     end
   end
 
@@ -327,32 +328,20 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
     end
   end
 
-  @tag :tmp_dir
-  test "transport batches exact-limit uploads and returns ordered results for one post", %{tmp_dir: tmp_dir} do
-    limit = opts()[:max_file_size]
-    first_bytes = :binary.copy("a", limit)
-    second_bytes = :binary.copy("b", limit)
-    path = Path.join(tmp_dir, "second.txt")
-    File.write!(path, second_bytes)
-
-    files = [
-      %{body: first_bytes, filename: "first.txt", content_type: "text/plain"},
-      %{path: path, filename: "second.txt", content_type: "text/plain"},
-      %{body: "last", filename: "third.txt", content_type: "text/plain"}
-    ]
-
-    assert {:ok, %{"file_infos" => infos}} = ReqClient.upload_files(@channel_id, files, opts())
-    assert Enum.map(infos, & &1["name"]) == ["first.txt", "second.txt", "third.txt"]
-    assert Enum.map(infos, & &1["size"]) == [limit, limit, 4]
+  test "host selects explicit requests and prepared bytes upload once with ordered identities" do
+    file = %{body: "first", filename: "first.txt", content_type: "text/plain"}
+    second = %{body: "second", filename: "second.txt", content_type: "text/plain"}
+    assert {:ok, prepared} = ReqClient.prepare_upload(@channel_id, [file, second], opts())
+    assert prepared.size_bytes == byte_size(prepared.body)
+    assert {:ok, %{"file_infos" => infos}} = ReqClient.upload_prepared(prepared, opts())
+    assert Enum.map(infos, & &1["name"]) == ["first.txt", "second.txt"]
     ids = Enum.map(infos, & &1["id"])
-    assert length(Enum.uniq(ids)) == 3
-    post = create_post("transport-managed upload batches", file_ids: ids)
+    assert length(Enum.uniq(ids)) == 2
+    post = create_post("host-selected upload candidate", file_ids: ids)
     assert {:ok, fetched} = ReqClient.fetch_post(post["id"], opts())
-    # Mattermost may reorder attachments when persisting the post. Upload results
-    # must preserve input order, but the saved post only needs every uploaded ID.
     assert Enum.sort(fetched["file_ids"]) == Enum.sort(ids)
 
-    for {id, bytes} <- Enum.zip(ids, [first_bytes, second_bytes, "last"]) do
+    for {id, bytes} <- Enum.zip(ids, ["first", "second"]) do
       assert {:ok, ^bytes} = ReqClient.download_file(id, opts())
     end
   end
@@ -410,24 +399,20 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
       {:ok, port} = :inet.port(socket)
       :ok = :gen_tcp.close(socket)
 
-      {:ok, opts: [url: "http://127.0.0.1:#{port}", token: System.get_env("MATTERMOST_TOKEN", ""), max_file_size: 1024]}
+      {:ok,
+       opts: [
+         url: "http://127.0.0.1:#{port}",
+         token: System.get_env("MATTERMOST_TOKEN", ""),
+         max_file_size: 1024,
+         max_upload_request_size: 2048
+       ]}
     end
 
     for operation <- [:upload, :send, :edit] do
       @operation operation
 
-      test "#{operation} returns neutral policy connection failures and preserves legacy errors", %{opts: opts} do
-        for policy <- [:continue, :abort] do
-          result = invoke_refused_connection(@operation, Keyword.put(opts, :attachment_failure_policy, policy))
-
-          if @operation == :upload do
-            assert {:error, {:partial_upload, %{reason: :econnrefused, uploaded: %{"file_infos" => []}}}} = result
-          else
-            assert {:error, :econnrefused} = result
-          end
-        end
-
-        assert {:error, %Req.TransportError{reason: :econnrefused}} = invoke_refused_connection(@operation, opts)
+      test "#{operation} returns a neutral connection failure without policy or retry", %{opts: opts} do
+        assert {:error, :econnrefused} = invoke_refused_connection(@operation, opts)
       end
     end
   end

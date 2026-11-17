@@ -42,9 +42,10 @@ Jido.Chat.Mattermost
 ├── Transport             ← @behaviour (HTTP contract)
 │   └── ReqClient         ← Production Req-based implementation
 │
-├── SendOptions           ← Unused (dead code — see adapter_violations.md #8)
-├── MetadataOptions       ← Unused (dead code — see adapter_violations.md #8)
-└── FetchOptions          ← Unused (dead code — see adapter_violations.md #8)
+├── SendOptions           ← Egress configuration and supplied upload references
+├── EditOptions           ← Existing-post state and replacement references
+├── MetadataOptions       ← Metadata fetch configuration
+└── FetchOptions          ← History query configuration
 ```
 
 ---
@@ -138,14 +139,21 @@ existing atom immediately before transport dispatch. Unknown names raise
 `ArgumentError`; they do not create atoms or fall back to the production
 transport. The SDK leaves this adapter-specific option value unchanged.
 
-Transports supporting uploads must implement `upload_files/3`, accepting a list
-even for a single file. The former `upload_file/3` callback is no longer called.
-The adapter owns individual file-size validation, the ten-attachment post limit,
-and delivery reporting. The transport owns encoded-body sizing and HTTP batching;
-one upload callback can make several requests, returning ordered file results
-only after all succeed. `ReqClient` keeps its multipart sizing private.
-See the [file-upload migration guide](../README.md#file-upload-migration-breaking-changes)
-for the request and response contract.
+Transports supporting uploads implement `upload_files/3` for exactly one
+host-selected candidate. The convenience operation can materialize paths but
+must not split, retry or publish. `prepare_upload/3` encodes materialized bytes
+without I/O; `upload_prepared/2` submits the same representation once. `ReqClient`
+returns the encoded binary, content type, byte count and ordered input metadata.
+The host selects requests; provider-local encoding determines their exact size.
+
+`max_upload_request_size` is an explicit encoded HTTP body ceiling, independent
+of `max_file_size`. Missing or invalid request configuration fails before upload.
+Oversized candidates fail as a whole. Each successful request returns one unique
+confirmed server ID per input in order. Server post attachment membership and
+order are authoritative and can differ from upload order. Failed or malformed
+responses never manufacture identities or expose response bodies in upload or
+publication errors. A failed operation can have an unconfirmed remote outcome;
+the host owns reconciliation, policy and retry decisions.
 
 ---
 
@@ -185,7 +193,9 @@ advertised by `configurable_max_file_size: :native` in the adapter capability ma
 resolved from per-call options before application configuration. Set it to the
 server's `FileSettings.MaxFileSize`; it is not discovered automatically. This is
 required for single-file sends, multiple-file posts, and attachment edits.
-Text-only operations do not require it. See the
+`max_upload_request_size` independently bounds the encoded request body;
+configure it from actual server/proxy limits. Text-only operations and supplied
+upload references do not require upload configuration. See the
 [README configuration example](../README.md#configuration).
 
 Call `Adapter.validate_files/2` before materialization to check declared sizes.

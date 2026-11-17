@@ -1,7 +1,7 @@
 defmodule Jido.Chat.Mattermost.AttachmentEditTest do
   use ExUnit.Case, async: true
 
-  alias Jido.Chat.{FileUpload, Postable, SentMessage, Thread}
+  alias Jido.Chat.{FileUpload, SentMessage, Thread}
   alias Jido.Chat.Mattermost.Adapter
   alias Jido.Chat.Mattermost.Test.RecordingTransport
 
@@ -19,6 +19,93 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
   test "capability matrix is coherent" do
     assert :ok = Jido.Chat.Adapter.validate_capabilities(Adapter)
     assert Adapter.capabilities().edit_attachments == :native
+  end
+
+  test "uploaded references post and edit through public SDK handles without reupload" do
+    Process.put({RecordingTransport, :delete_message}, {:ok, %{}})
+    refs = [%{id: "file", filename: "confirmed.png", media_type: "image/png", size_bytes: 2}]
+    Process.put({RecordingTransport, :send_message}, {:ok, %{"id" => "post", "file_ids" => ["file"]}})
+    thread = Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
+    assert {:ok, sent} = Thread.post(thread, "Caption", transport: RecordingTransport, uploaded_files: refs)
+    assert sent.id == "post"
+    assert [%{filename: "confirmed.png", url: "mattermost://file/file"}] = sent.attachments
+    assert_received {:transport_call, :send_message, ["room", "Caption", options]}
+    assert options[:file_ids] == ["file"]
+    restored = sent |> SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> SentMessage.from_map()
+    assert {:ok, edited} = SentMessage.edit(restored, "Changed", uploaded_files: refs)
+    assert edited.id == "post"
+    assert [%{filename: "confirmed.png"}] = edited.attachments
+    assert_received {:transport_call, :edit_message, ["room", "post", "Changed", options]}
+    assert options[:file_ids] == ["file"]
+    assert :ok = SentMessage.delete(edited)
+    assert_received {:transport_call, :delete_message, ["room", "post", _]}
+    refute_received {:transport_call, :upload_files, _}
+    refute_received {:transport_call, :send_message, _}
+    refute_received {:transport_call, :edit_message, _}
+  end
+
+  test "malformed or excessive uploaded references fail before publication" do
+    for refs <- [
+          [%{id: ""}],
+          [%{filename: "input-only"}],
+          [%{id: "a/b"}],
+          [%{id: "same"}, %{id: "same"}],
+          [%{id: "file", filename: %{invalid: true}}],
+          [%{id: "file"} | :invalid],
+          :invalid
+        ] do
+      assert {:error, :invalid_uploaded_files} =
+               Adapter.send_message("room", "caption", transport: RecordingTransport, uploaded_files: refs)
+
+      assert {:error, :invalid_uploaded_files} =
+               Adapter.edit_message("room", "post", "caption", transport: RecordingTransport, uploaded_files: refs)
+    end
+
+    assert {:error, {:too_many_files, 10}} =
+             Adapter.send_message("room", "caption",
+               transport: RecordingTransport,
+               uploaded_files: Enum.map(1..11, &%{id: "file-#{&1}"})
+             )
+
+    refute_received {:transport_call, _, _}
+  end
+
+  test "explicit empty uploaded references clear attachments on the same post" do
+    Process.put({RecordingTransport, :edit_message}, {:ok, %{"id" => "post", "file_ids" => []}})
+
+    assert {:ok, response} =
+             Adapter.edit_message("room", "post", "caption", transport: RecordingTransport, uploaded_files: [])
+
+    assert response.metadata.attachments == []
+    assert response.metadata.file_ids == []
+    assert_received {:transport_call, :edit_message, ["room", "post", "caption", options]}
+    assert options[:file_ids] == []
+    refute_received {:transport_call, _, _}
+  end
+
+  test "malformed upload identities never escape or reach publication" do
+    for infos <- [["input-id"], [nil], [%{"name" => "input.txt"}], [%{"id" => "file"} | :invalid]] do
+      Process.put({RecordingTransport, :upload_files}, {:ok, %{"file_infos" => infos}})
+
+      assert {:error, :unconfirmed_upload} =
+               Adapter.send_file("room", %FileUpload{data: "bytes", filename: "input.txt"},
+                 transport: RecordingTransport,
+                 max_file_size: 100
+               )
+
+      assert_received {:transport_call, :upload_files, _}
+      refute_received {:transport_call, _, _}
+    end
+  end
+
+  test "an edit response cannot redirect a handle to a different post" do
+    Process.put({RecordingTransport, :edit_message}, {:ok, %{"id" => "different", "file_ids" => []}})
+
+    assert {:error, :unconfirmed_delivery} =
+             Adapter.edit_message("room", "post", "changed", transport: RecordingTransport)
+
+    assert_received {:transport_call, :edit_message, ["room", "post", "changed", _]}
+    refute_received {:transport_call, _, _}
   end
 
   test "SentMessage.edit uploads a file and updates the same message with delivery metadata" do
@@ -637,7 +724,7 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
   test "failed or incomplete batch uploads prevent posting a partial attachment set" do
     for operation <- [:post, :edit],
         {result, reason} <- [
-          {{:error, {413, "too large"}}, {413, "too large"}},
+          {{:error, {413, "too large"}}, {:http_error, 413}},
           {{:error, :timeout}, :timeout},
           {{:ok, %{"file_infos" => []}}, :missing_uploaded_file_id},
           {{:ok, %{"file_infos" => [%{"id" => "one"}]}}, :unconfirmed_upload},
@@ -740,267 +827,119 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
     end
   end
 
-  test "fifteen files return two confirmed posts through the SDK" do
-    files = for i <- 1..15, do: %FileUpload{data: :binary.copy("x", 1024), filename: "#{i}.txt"}
-    payload = Jido.Chat.Postable.text("All files", files: files)
-    thread = Jido.Chat.Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
-
-    assert {:ok, sent} = Jido.Chat.Thread.post(thread, payload, transport: SizedTransport, max_file_size: 307_200)
-
-    assert %{confirmation: :confirmed, messages: [first, second], failed_files: []} =
-             sent.response.metadata.delivery_report
-
-    assert first.message_id != second.message_id
-    assert length(first.metadata.file_ids) == 10
-    assert length(second.metadata.file_ids) == 5
-    assert first.body == "All files"
-    assert second.body == "Additional files (2/2)."
-    assert sent.id == first.message_id
-    assert_received {:batch, batch}
-    assert length(batch) == 10
-    assert_received {:batch, batch}
-    assert length(batch) == 5
-    refute_received {:batch, _}
-  end
-
-  for entry <- [Jido.Chat.Thread, Jido.Chat.ChannelRef], scenario <- [:split, :rejected] do
+  for entry <- [Jido.Chat.Thread, Jido.Chat.ChannelRef] do
     @posting_entry entry
-    @delivery_scenario scenario
-    test "#{entry} handle contains only confirmed first-post files for #{scenario} delivery" do
-      files =
-        case @delivery_scenario do
-          :split ->
-            for i <- 1..15, do: %FileUpload{data: "x", filename: "#{i}.txt"}
-
-          :rejected ->
-            [
-              %FileUpload{data: "x", filename: "valid.txt"},
-              %FileUpload{data: :binary.copy("x", 1025), filename: "large.txt"}
-            ]
-        end
+    test "#{entry} rejects fifteen files before any upload or publication" do
+      files = for i <- 1..15, do: %FileUpload{data: "x", filename: "#{i}.txt"}
 
       target =
-        case @posting_entry do
-          Jido.Chat.Thread ->
-            Jido.Chat.Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
-
-          Jido.Chat.ChannelRef ->
+        if @posting_entry == Jido.Chat.Thread,
+          do:
+            Jido.Chat.Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"}),
+          else:
             Jido.Chat.ChannelRef.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_id: "room"})
-        end
 
-      assert {:ok, sent} =
+      assert {:error, {:too_many_files, 10}} =
                @posting_entry.post(target, Jido.Chat.Postable.text("files", files: files),
                  transport: SizedTransport,
                  max_file_size: 1024
                )
 
-      report = sent.response.metadata.delivery_report
-      [first | rest] = report.messages
-      assert sent.id == first.message_id
-      assert sent.attachments == first.metadata.attachments
-      assert Enum.all?(sent.attachments, &is_nil(&1.data))
-
-      restored =
-        sent |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> Jido.Chat.SentMessage.from_map()
-
-      assert restored.default_opts == Keyword.put(sent.default_opts, :transport, Atom.to_string(SizedTransport))
-      assert Enum.map(restored.attachments, & &1.url) == Enum.map(sent.attachments, & &1.url)
-      replacement = Jido.Chat.Postable.text("replacement", files: [%FileUpload{data: "new", filename: "new.txt"}])
-      assert {:ok, edited} = Jido.Chat.SentMessage.edit(restored, replacement)
-      assert edited.id == sent.id
-      assert [attachment] = edited.attachments
-      assert attachment.url == "mattermost://file/new.txt"
-
-      case @delivery_scenario do
-        :split ->
-          assert length(sent.attachments) == 10
-          assert [second] = rest
-          assert length(second.metadata.attachments) == 5
-          assert second.thread_id == first.message_id
-          assert report.confirmation == :confirmed
-
-        :rejected ->
-          assert [attachment] = sent.attachments
-          assert attachment.filename == "valid.txt"
-          assert rest == []
-          assert [%{filename: "large.txt", reason: :file_too_large}] = report.failed_files
-          assert report.confirmation == :partial
-      end
+      refute_received {:batch, _}
+      refute_received {:posted, _}
     end
+  end
+
+  test "too many edit files leave the existing post untouched" do
+    files = for i <- 1..15, do: %FileUpload{data: "x", filename: "#{i}.txt"}
+
+    assert {:error, {:too_many_files, 10}} =
+             Adapter.edit_message("room", "existing", "answer",
+               files: files,
+               transport: SizedTransport,
+               max_file_size: 1024
+             )
+
+    refute_received {:batch, _}
+    refute_received {:edited, _}
+    refute_received {:posted, _}
   end
 
   for restored? <- [false, true] do
     @restore_partial_handle restored?
-    test "replacement does not retain a stale partial delivery report with restored handle #{@restore_partial_handle}" do
-      thread =
-        Jido.Chat.Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
-
-      files = [
-        %FileUpload{data: "old", filename: "old.txt"},
-        %FileUpload{data: String.duplicate("x", 11), filename: "oversized.txt"}
-      ]
-
-      assert {:ok, sent} =
-               Jido.Chat.Thread.post(thread, Jido.Chat.Postable.text("Original", files: files),
-                 transport: SizedTransport,
-                 max_file_size: 10
-               )
-
-      assert %{confirmation: :partial, failed_files: [%{filename: "oversized.txt"}]} =
-               sent.response.metadata.delivery_report
+    test "replacement clears an old partial report with restored handle #{@restore_partial_handle}" do
+      stale = %{confirmation: :partial, failed_files: [%{filename: "oversized.txt", reason: :file_too_large}]}
 
       sent =
-        if @restore_partial_handle do
-          sent
-          |> Jido.Chat.SentMessage.to_map()
-          |> Jason.encode!()
-          |> Jason.decode!()
-          |> Jido.Chat.SentMessage.from_map()
-        else
-          sent
-        end
+        SentMessage.new(%{
+          adapter: Adapter,
+          response: %{external_message_id: "post", external_room_id: "room", metadata: %{delivery_report: stale}},
+          metadata: %{delivery_report: stale},
+          default_opts: [transport: SizedTransport, max_file_size: 10]
+        })
+
+      sent =
+        if @restore_partial_handle,
+          do: sent |> SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> SentMessage.from_map(),
+          else: sent
 
       replacement = Jido.Chat.Postable.text("Replacement", files: [%FileUpload{data: "new", filename: "new.txt"}])
-      assert {:ok, edited} = Jido.Chat.SentMessage.edit(sent, replacement)
+      assert {:ok, edited} = SentMessage.edit(sent, replacement)
       assert edited.id == sent.id
       assert edited.metadata.file_ids == ["new.txt"]
       assert [%{filename: "new.txt", url: "mattermost://file/new.txt"}] = edited.attachments
-
-      serialized = edited |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!()
-
-      # A single-post edit may clear the report or publish its current result.
-      # Neither representation may retain the previous operation's failures/files.
-      if report = serialized["metadata"]["delivery_report"] do
-        assert report["confirmation"] == "confirmed"
-        assert report["failed_files"] == []
-        assert [message] = report["messages"]
-        assert message["message_id"] == edited.id
-        assert message["body"] == "Replacement"
-        assert message["metadata"]["file_ids"] == ["new.txt"]
-      end
+      serialized = edited |> SentMessage.to_map() |> Jason.encode!() |> Jason.decode!()
+      assert serialized["metadata"]["delivery_report"] == nil
+      assert serialized["response"]["metadata"]["delivery_report"] == nil
+      refute_received {:posted, _}
     end
   end
 
-  test "nine valid files are posted and the oversized file is reported" do
-    files =
-      for i <- 1..10,
-          do: %FileUpload{data: :binary.copy("x", if(i == 6, do: 307_201, else: 1024)), filename: "#{i}.txt"}
+  test "an oversized sibling rejects the complete selection before upload" do
+    files = [
+      %FileUpload{data: "valid", filename: "small.txt"},
+      %FileUpload{data: String.duplicate("x", 1025), filename: "large.txt"}
+    ]
 
-    assert {:ok, response} =
+    assert {:error, {:file_too_large, %{filename: "large.txt", size: 1025, limit: 1024}}} =
              Adapter.post_message("room", Jido.Chat.PostPayload.new(%{files: files}),
                transport: SizedTransport,
-               max_file_size: 307_200
+               max_file_size: 1024
              )
 
-    assert %{confirmation: :partial, messages: [post], failed_files: [failure]} = response.metadata.delivery_report
-    assert length(post.metadata.file_ids) == 9
-    assert failure.filename == "6.txt"
-    assert failure.reason == :file_too_large
-    assert failure.size == 307_201
-    assert_received {:batch, batch}
-    assert length(batch) == 9
-  end
-
-  test "editing fifteen files updates the original and posts the remaining five in its thread" do
-    files = for i <- 1..15, do: %FileUpload{data: "x", filename: "#{i}.txt"}
-
-    assert {:ok, response} =
-             Adapter.edit_message("room", "existing", "answer",
-               files: files,
-               transport: SizedTransport,
-               max_file_size: 307_200
-             )
-
-    assert %{messages: [first, second], confirmation: :confirmed} = response.metadata.delivery_report
-    assert first.action == :updated
-    assert first.message_id == "existing"
-    assert second.action == :created
-    assert second.thread_id == "existing"
-    assert_received {:edited, first_ids}
-    assert length(first_ids) == 10
-    assert_received {:posted, next_ids}
-    assert length(next_ids) == 5
-    assert_received {:post_opts, options}
-    assert options[:thread_id] == "existing"
+    refute_received {:batch, _}
+    refute_received {:posted, _}
   end
 
   for requested_root <- [nil, "stale-root"] do
     @requested_root requested_root
-    test "restored reply edits report and use the server root with requested root #{inspect(requested_root)}" do
+    test "restored reply edits retain the returned root without additional posts with requested root #{inspect(requested_root)}" do
       Process.put(:edit_root_id, "existing-root")
-      defaults = [transport: SizedTransport, max_file_size: 1024]
-      defaults = if @requested_root, do: Keyword.put(defaults, :thread_id, @requested_root), else: defaults
 
       sent =
-        Jido.Chat.SentMessage.new(%{
+        SentMessage.new(%{
           adapter: Adapter,
           response: %{external_message_id: "reply", external_room_id: "room"},
-          default_opts: defaults
+          default_opts: [transport: SizedTransport, max_file_size: 1024, thread_id: @requested_root]
         })
 
-      restored =
-        sent |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> Jido.Chat.SentMessage.from_map()
+      restored = sent |> SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> SentMessage.from_map()
 
-      files = for i <- 1..15, do: %FileUpload{data: "x", filename: "#{i}.txt"}
-      assert {:ok, edited} = Jido.Chat.SentMessage.edit(restored, Jido.Chat.Postable.text("replacement", files: files))
+      assert {:ok, edited} =
+               SentMessage.edit(
+                 restored,
+                 Jido.Chat.Postable.text("replacement", files: [%FileUpload{data: "x", filename: "one.txt"}])
+               )
+
       assert edited.id == "reply"
-      assert length(edited.attachments) == 10
-      assert [first, second] = edited.response.metadata.delivery_report.messages
-      assert first.action == :updated
-      assert first.metadata.root_id == "existing-root"
-      assert first.thread_id == "existing-root"
-      assert second.thread_id == "existing-root"
-      assert_received {:post_opts, options}
-      assert options[:thread_id] == "existing-root"
-
-      serialized = edited |> Jido.Chat.SentMessage.to_map() |> Jason.encode!() |> Jason.decode!()
-
-      assert Enum.all?(
-               serialized["response"]["metadata"]["delivery_report"]["messages"],
-               &(&1["thread_id"] == "existing-root")
-             )
+      assert length(edited.attachments) == 1
+      assert edited.response.metadata.root_id == "existing-root"
+      assert_received {:batch, [_]}
+      assert_received {:edited, ["one.txt"]}
+      refute_received {:batch, _}
+      refute_received {:edited, _}
+      refute_received {:posted, _}
     end
-  end
-
-  test "later failure returns confirmed messages and identifies unconfirmed and unattempted files" do
-    Process.put(:fail_post_number, 2)
-    files = for i <- 1..25, do: %FileUpload{data: "x", filename: "#{i}.txt"}
-
-    assert {:ok, response} =
-             Adapter.post_message("room", Jido.Chat.PostPayload.new(%{files: files}),
-               transport: SizedTransport,
-               max_file_size: 307_200
-             )
-
-    assert %{messages: [first], confirmation: :partial, failed_files: failures} = response.metadata.delivery_report
-    assert length(first.metadata.file_ids) == 10
-    assert Enum.count(failures, &(&1.reason == :timeout and &1.delivery == :unconfirmed)) == 10
-    assert Enum.count(failures, &(&1.reason == :not_attempted and &1.delivery == :not_sent)) == 5
-    assert Process.get(:sized_post_count) == 2
-  end
-
-  test "fifteen exact-limit files are passed to the transport in two post groups" do
-    files = for i <- 1..15, do: %FileUpload{data: :binary.copy("x", 307_200), filename: "#{i}.txt"}
-
-    assert {:ok, response} =
-             Adapter.post_message("room", Jido.Chat.PostPayload.new(%{files: files}),
-               transport: SizedTransport,
-               max_file_size: 307_200,
-               thread_id: "root"
-             )
-
-    assert %{messages: [first, second], confirmation: :confirmed} = response.metadata.delivery_report
-    assert first.thread_id == "root"
-    assert second.thread_id == "root"
-    assert_received {:batch, first_batch}
-    assert length(first_batch) == 10
-    assert_received {:batch, second_batch}
-    assert length(second_batch) == 5
-    refute_received {:batch, _}
-    assert_received {:posted, first_ids}
-    assert length(first_ids) == 10
-    assert_received {:posted, last_ids}
-    assert length(last_ids) == 5
   end
 
   test "sparse results preserve per-file fallbacks for a transport-managed upload group" do
@@ -1117,105 +1056,4 @@ defmodule Jido.Chat.Mattermost.AttachmentEditTest do
       ]
     ]
   end
-
-  describe "attachment continuation routing" do
-    @describetag capture_log: true
-
-    for {entry, restored?} <- [edit: false, edit: true, post: false],
-        policy <- [nil, :continue, :abort],
-        root_key <- [:root_id, "root_id"],
-        {root, saved_root} <- [
-          {"", "stale-other-root"},
-          {"server-root", "stale-other-root"},
-          {:omitted, "saved-root"},
-          {:omitted, nil}
-        ] do
-      @entry entry
-      @restored restored?
-      @policy policy
-      @root_key root_key
-      @root root
-      @saved_root saved_root
-
-      test "#{entry} restored=#{restored?} policy=#{inspect(policy)} #{inspect(root_key)}=#{inspect(root)} saved=#{inspect(saved_root)}" do
-        files = for i <- 1..11, do: %FileUpload{filename: "#{i}.txt", data: "x"}
-        first_ids = Enum.map(Enum.take(files, 10), & &1.filename)
-        last_ids = ["11.txt"]
-        first_id = "original"
-        first_post = server_post(first_id, first_ids, @root_key, @root)
-
-        Process.put({RecordingTransport, :upload_files}, fn ->
-          count = Process.get(:upload_count, 0)
-          Process.put(:upload_count, count + 1)
-          ids = if count == 0, do: first_ids, else: last_ids
-          {:ok, %{"file_infos" => Enum.map(ids, &%{"id" => &1, "name" => &1})}}
-        end)
-
-        Process.put({RecordingTransport, :edit_message}, {:ok, first_post})
-
-        Process.put({RecordingTransport, :send_message}, fn ->
-          count = Process.get(:send_count, 0)
-          Process.put(:send_count, count + 1)
-
-          if @entry == :post and count == 0,
-            do: {:ok, first_post},
-            else: {:ok, %{"id" => "continuation", "file_ids" => last_ids}}
-        end)
-
-        defaults = [transport: RecordingTransport, max_file_size: 1024, thread_id: @saved_root]
-        defaults = if @policy, do: Keyword.put(defaults, :attachment_failure_policy, @policy), else: defaults
-        payload = Postable.text("Replacement", files: files)
-
-        result =
-          if @entry == :edit do
-            sent =
-              SentMessage.new(%{
-                adapter: Adapter,
-                response: %{external_message_id: first_id, external_room_id: "room"},
-                default_opts: defaults
-              })
-
-            sent = if @restored, do: restore(sent), else: sent
-            SentMessage.edit(sent, payload)
-          else
-            thread = Thread.new(%{id: "room", adapter: Adapter, adapter_name: :mattermost, external_room_id: "room"})
-            Thread.post(thread, payload, defaults)
-          end
-
-        assert {:ok, delivered} = result
-
-        first_thread =
-          case @root do
-            "" -> first_id
-            :omitted -> @saved_root
-            root -> root
-          end
-
-        continuation_thread = continuation_target(first_thread, first_id)
-
-        if @entry == :post, do: assert_received({:transport_call, :send_message, ["room", "Replacement", _]})
-        assert_received {:transport_call, :send_message, ["room", "Additional files (2/2).", continuation_opts]}
-        assert continuation_opts[:thread_id] == continuation_thread
-        assert continuation_opts[:file_ids] == last_ids
-        assert delivered.id == first_id
-        assert Enum.map(delivered.attachments, & &1.metadata.file_id) == first_ids
-
-        assert %{confirmation: :confirmed, messages: [first, second], failed_files: []} =
-                 delivered.response.metadata.delivery_report
-
-        assert first.message_id == first_id
-        assert first.thread_id == first_thread
-        assert second.thread_id == continuation_thread
-        assert first.metadata.file_ids == first_ids
-        assert second.metadata.file_ids == last_ids
-        refute_received {:transport_call, :send_message, _}
-      end
-    end
-  end
-
-  defp server_post(id, ids, _key, :omitted), do: %{"id" => id, "file_ids" => ids}
-  defp server_post(id, ids, key, root), do: Map.put(%{"id" => id, "file_ids" => ids}, key, root)
-  defp continuation_target(nil, id), do: id
-  defp continuation_target(root, _id), do: root
-  defp restore(sent), do: sent |> SentMessage.to_map() |> Jason.encode!() |> Jason.decode!() |> SentMessage.from_map()
 end

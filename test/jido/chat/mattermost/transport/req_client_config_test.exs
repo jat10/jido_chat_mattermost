@@ -28,67 +28,50 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientConfigTest do
 
   test "unusable upload sources fail without making a request" do
     for file <- [%{}, %{path: ""}, %{body: ""}, %{body: "bytes"}, %{body: "bytes", filename: ""}] do
-      assert {:error, :missing_file_source} =
-               Jido.Chat.Mattermost.Transport.ReqClient.upload_files("c1", [file], [])
+      assert {:error, :missing_file_source} = ReqClient.upload_files("c1", [file], [])
     end
 
-    assert {:error, :missing_file_source} =
-             Jido.Chat.Mattermost.Transport.ReqClient.upload_files("c1", [], [])
+    assert {:error, :missing_file_source} = ReqClient.upload_files("c1", [], [])
   end
 
-  test "policy uploads report invalid URL configuration without claiming a confirmed upload" do
+  test "upload and publication exceptions are always neutral without policy" do
+    opts = [url: "", token: "test-token", max_upload_request_size: 2048]
     file = %{body: "bytes", filename: "file.txt"}
-    opts = [url: "", token: "test-token", max_file_size: 1024]
-
-    for policy <- [:abort, :continue] do
-      assert {:error, {:partial_upload, %{reason: :transport_exception, uploaded: %{"file_infos" => []}}}} =
-               Jido.Chat.Mattermost.Transport.ReqClient.upload_files(
-                 "room",
-                 [file],
-                 Keyword.put(opts, :attachment_failure_policy, policy)
-               )
-    end
-
-    assert_raise ArgumentError, fn ->
-      Jido.Chat.Mattermost.Transport.ReqClient.upload_files("room", [file], opts)
-    end
+    assert {:error, :transport_exception} = ReqClient.upload_files("room", [file], opts)
+    assert {:error, :transport_exception} = ReqClient.send_message("room", "Answer", opts)
+    assert {:error, :transport_exception} = ReqClient.edit_message("room", "post", "Answer", opts)
   end
 
-  test "policy publication exceptions use neutral errors and legacy calls still raise" do
-    opts = [url: "", token: "test-token"]
-
-    for policy <- [:abort, :continue] do
-      policy_opts = Keyword.put(opts, :attachment_failure_policy, policy)
-
-      assert {:error, :transport_exception} =
-               Jido.Chat.Mattermost.Transport.ReqClient.send_message("room", "Answer", policy_opts)
-
-      assert {:error, :transport_exception} =
-               Jido.Chat.Mattermost.Transport.ReqClient.edit_message("room", "post", "Answer", policy_opts)
-    end
-
-    assert_raise ArgumentError, fn -> Jido.Chat.Mattermost.Transport.ReqClient.send_message("room", "Answer", opts) end
-
-    assert_raise ArgumentError, fn ->
-      Jido.Chat.Mattermost.Transport.ReqClient.edit_message("room", "post", "Answer", opts)
-    end
-  end
-
-  @tag :tmp_dir
-  test "path-backed upload batches are fully sized before making a request", %{tmp_dir: tmp_dir} do
-    path = Path.join(tmp_dir, "file.txt")
-    File.write!(path, "bytes")
-    long_header = %{body: "bytes", filename: String.duplicate("long", 1000) <> ".txt"}
+  test "exact encoded size is accepted and one byte less is rejected without hidden splitting" do
+    files = [%{body: "bytes", filename: "file.txt"}, %{body: "two", filename: "second.txt"}]
+    assert {:ok, prepared} = ReqClient.prepare_upload("room", files, max_upload_request_size: 10000)
+    assert prepared.size_bytes == byte_size(prepared.body)
+    assert length(prepared.files) == 2
+    assert prepared.body =~ "bytes"
+    assert prepared.body =~ "second.txt"
+    assert prepared.content_type =~ "multipart/form-data; boundary="
+    assert {:ok, exact} = ReqClient.prepare_upload("room", files, max_upload_request_size: prepared.size_bytes)
+    assert exact.size_bytes == prepared.size_bytes
 
     assert {:error, :upload_request_too_large} =
-             Jido.Chat.Mattermost.Transport.ReqClient.upload_files(
-               "room",
-               [%{path: path}, %{body: "bytes", filename: "second.txt"}, long_header],
-               max_file_size: 1024
-             )
+             ReqClient.prepare_upload("room", files, max_upload_request_size: prepared.size_bytes - 1)
+
+    assert {:error, :upload_request_too_large} =
+             ReqClient.upload_prepared(prepared, max_upload_request_size: prepared.size_bytes - 1)
   end
 
-  test "upload sizing rejects missing or invalid limits before making a request" do
+  test "header-heavy and too-large singleton candidates are rejected as a whole" do
+    for files <- [
+          [%{body: "x", filename: String.duplicate("long", 1000)}],
+          [%{body: String.duplicate("x", 2048), filename: "large.txt"}],
+          [%{body: "x", filename: "small.txt"}, %{body: "x", filename: String.duplicate("long", 1000)}]
+        ] do
+      assert {:error, :upload_request_too_large} =
+               ReqClient.prepare_upload("room", files, max_upload_request_size: 1024)
+    end
+  end
+
+  test "request limits are explicit and independent of per-file limits" do
     file = %{body: "x", filename: "file.txt"}
 
     for {limit, reason} <- [
@@ -97,69 +80,41 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientConfigTest do
           {-1, :invalid_configuration},
           {"10", :invalid_configuration}
         ] do
-      assert {:error, {^reason, :max_file_size}} =
-               Jido.Chat.Mattermost.Transport.ReqClient.upload_files("room", [file], max_file_size: limit)
+      assert {:error, {^reason, :max_upload_request_size}} =
+               ReqClient.prepare_upload("room", [file], max_upload_request_size: limit, max_file_size: 999_999)
+    end
+
+    assert {:ok, _} = ReqClient.prepare_upload("room", [file], max_upload_request_size: 2048, max_file_size: nil)
+  end
+
+  test "empty candidates and malformed prepared representations never reach HTTP" do
+    for files <- [[], nil, :invalid] do
+      assert {:error, :missing_file_source} = ReqClient.prepare_upload("room", files, [])
+    end
+
+    for prepared <- [%{}, %{body: "bytes", content_type: "multipart/form-data", size_bytes: 4, files: [%{}]}] do
+      assert {:error, :invalid_prepared_upload} = ReqClient.upload_prepared(prepared, [])
     end
   end
 
-  test "multipart overhead is checked for every file before any upload" do
-    file = %{body: "x", filename: "small.txt"}
-    long_header = %{body: "x", filename: String.duplicate("long", 1000) <> ".txt"}
+  @tag :tmp_dir
+  test "pure preparation never reads paths and convenience uploads contain missing-file errors", %{tmp_dir: tmp_dir} do
+    path = Path.join(tmp_dir, "missing.txt")
 
-    # No URL or token: reaching HTTP before planning the later file would raise.
-    assert {:error, :upload_request_too_large} =
-             Jido.Chat.Mattermost.Transport.ReqClient.upload_files("room", [file, long_header], max_file_size: 1024)
-  end
+    assert {:error, :file_not_materialized} =
+             ReqClient.prepare_upload("room", [%{path: path}], max_upload_request_size: 2048)
 
-  describe "multipart preparation failures" do
-    for policy <- [:abort, :continue] do
-      @policy policy
+    assert {:error, :file_unavailable} = ReqClient.upload_files("room", [%{path: path}], max_upload_request_size: 2048)
+    File.write!(path, "bytes")
 
-      @tag :tmp_dir
-      test "#{policy} returns a neutral error when a path is missing during multipart preparation", %{tmp_dir: tmp_dir} do
-        path = Path.join(tmp_dir, "missing.txt")
-        refute File.exists?(path)
+    assert {:error, :file_not_materialized} =
+             ReqClient.prepare_upload("room", [%{path: path}], max_upload_request_size: 2048)
 
-        # A valid sibling must not be uploaded before all multipart sizing succeeds.
-        # The deliberately invalid URL prevents any network request in this test.
-        assert {:error, :transport_exception} =
-                 ReqClient.upload_files(
-                   "room",
-                   [%{body: "content", filename: "valid.txt"}, %{path: path, filename: "missing.txt"}],
-                   attachment_failure_policy: @policy,
-                   max_file_size: 1024,
-                   url: "",
-                   token: "test-token"
-                 )
-      end
-    end
-
-    @tag :tmp_dir
-    test "omitted policy preserves path preparation exceptions", %{tmp_dir: tmp_dir} do
-      assert_raise File.Error, fn ->
-        ReqClient.upload_files("room", [%{path: Path.join(tmp_dir, "missing.txt")}],
-          max_file_size: 1024,
-          url: "",
-          token: "test-token"
-        )
-      end
-    end
-
-    test "policy preparation retains ordinary validation errors" do
-      for policy <- [:abort, :continue] do
-        opts = [attachment_failure_policy: policy, max_file_size: nil]
-        assert {:error, :missing_file_source} = ReqClient.upload_files("room", [%{}], opts)
-
-        assert {:error, {:missing_configuration, :max_file_size}} =
-                 ReqClient.upload_files("room", [%{body: "x", filename: "file.txt"}], opts)
-
-        assert {:error, :upload_request_too_large} =
-                 ReqClient.upload_files(
-                   "room",
-                   [%{body: "x", filename: String.duplicate("long", 1000)}],
-                   Keyword.put(opts, :max_file_size, 1024)
-                 )
-      end
-    end
+    assert {:error, :transport_exception} =
+             ReqClient.upload_files("room", [%{path: path}],
+               max_upload_request_size: 2048,
+               url: "",
+               token: "test-token"
+             )
   end
 end

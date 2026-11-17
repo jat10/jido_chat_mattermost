@@ -1,7 +1,8 @@
 defmodule Jido.Chat.Mattermost.EditOptions do
   @moduledoc "Options for editing a Mattermost post."
 
-  defstruct attachment_failure_policy: nil,
+  defstruct uploaded_files: nil,
+            max_upload_request_size: nil,
             max_file_size: nil,
             files: [],
             previous_metadata: %{},
@@ -10,7 +11,8 @@ defmodule Jido.Chat.Mattermost.EditOptions do
             url: nil
 
   @type t :: %__MODULE__{
-          attachment_failure_policy: :abort | :continue | nil,
+          uploaded_files: term(),
+          max_upload_request_size: pos_integer() | nil,
           files: [Jido.Chat.FileUpload.t()],
           previous_metadata: map(),
           max_file_size: pos_integer() | nil,
@@ -23,7 +25,13 @@ defmodule Jido.Chat.Mattermost.EditOptions do
   @spec new(keyword()) :: t()
   def new(opts \\ []) do
     %__MODULE__{
-      attachment_failure_policy: opts[:attachment_failure_policy],
+      uploaded_files: opts[:uploaded_files],
+      max_upload_request_size:
+        Keyword.get(
+          opts,
+          :max_upload_request_size,
+          Application.get_env(:jido_chat_mattermost, :max_upload_request_size)
+        ),
       files: Keyword.get(opts, :files, []),
       previous_metadata: Keyword.get(opts, :previous_metadata, %{}),
       max_file_size: Keyword.get(opts, :max_file_size, Application.get_env(:jido_chat_mattermost, :max_file_size)),
@@ -37,7 +45,7 @@ defmodule Jido.Chat.Mattermost.EditOptions do
   @spec transport_opts(t()) :: keyword()
   def transport_opts(%__MODULE__{} = o) do
     []
-    |> maybe_put(:attachment_failure_policy, o.attachment_failure_policy)
+    |> maybe_put(:max_upload_request_size, o.max_upload_request_size)
     |> maybe_put(:max_file_size, o.max_file_size)
     |> maybe_put(:token, o.token)
     |> maybe_put(:url, o.url)

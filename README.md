@@ -15,8 +15,8 @@ This package is being prepared for the Jido 1.x chat package release line. It is
 ```elixir
 def deps do
   [
-    {:jido_chat, github: "agentjido/jido_chat", branch: "main"},
-    {:jido_chat_mattermost, github: "agentjido/jido_chat_mattermost", branch: "main"}
+    {:jido_chat, github: "jat10/jido_chat", ref: "f17679337a9975bee43b9540cb08ac5cfc12b86a", override: true},
+    {:jido_chat_mattermost, github: "jat10/jido_chat_mattermost", branch: "fix/attachment-edit-history"}
   ]
 end
 ```
@@ -24,7 +24,9 @@ end
 ## Configuration
 
 Token and base URL can be provided per-call via opts or set globally.
-File uploads also require `max_file_size`, a positive integer in bytes matching
+File uploads require `max_upload_request_size` for the exact encoded body and
+`max_file_size` for individual files. Both are independently configured.
+The per-file limit is a positive integer in bytes matching
 your Mattermost server's `FileSettings.MaxFileSize`. This applies to single-file
 sends, multiple-file posts, and attachment edits. Text-only sends and edits do
 not require it.
@@ -36,7 +38,8 @@ For an application that uploads files, configure:
 config :jido_chat_mattermost,
   url: "https://mattermost.yourcompany.com",
   token: System.get_env("MATTERMOST_BOT_TOKEN"),
-  max_file_size: System.fetch_env!("MATTERMOST_MAX_FILE_SIZE") |> String.to_integer()
+  max_file_size: System.fetch_env!("MATTERMOST_MAX_FILE_SIZE") |> String.to_integer(),
+  max_upload_request_size: System.fetch_env!("MATTERMOST_MAX_UPLOAD_REQUEST_SIZE") |> String.to_integer()
 ```
 
 Set `MATTERMOST_MAX_FILE_SIZE` in your application's environment to the server's
@@ -77,6 +80,7 @@ alias Jido.Chat.Mattermost.Adapter
     %{path: "/tmp/report.pdf", filename: "report.pdf", media_type: "application/pdf"},
     token: "my-token",
     max_file_size: System.fetch_env!("MATTERMOST_MAX_FILE_SIZE") |> String.to_integer(),
+    max_upload_request_size: System.fetch_env!("MATTERMOST_MAX_UPLOAD_REQUEST_SIZE") |> String.to_integer(),
     caption: "Latest report"
   )
 
@@ -132,8 +136,8 @@ children = [
 ]
 ```
 
-Each incoming WebSocket event is normalized to a `%Jido.Chat.Incoming{}` struct and
-delivered via `sink_mfa`. Multiple Mattermost instances can coexist on the same node
+Each incoming WebSocket event is delivered raw via `sink_mfa`; the caller invokes
+`Adapter.transform_incoming/1` when normalization is needed. Multiple Mattermost instances can coexist on the same node
 by using distinct `bridge_id` values.
 
 ## Transport
@@ -148,35 +152,52 @@ Adapter.send_message("ch001", "hello", transport: MyFakeTransport, token: "x")
 
 ### File-upload migration (breaking changes)
 
-Existing integrations must make two changes when adopting multiple-file delivery:
+The provider now performs one requested operation. It never selects upload
+batches, omits failed files, splits posts, generates continuation captions,
+chooses continuation threads, retries or applies an attachment failure policy.
+`attachment_failure_policy` is retired and returns an explicit unsupported-option
+error; migrate stored handle options as well as new calls.
 
-1. **Configure `max_file_size` for every upload path.** Calls to `send_file/3`
-   that previously needed only authentication now also need this setting, either
-   in per-call options or application configuration as shown above. The same
-   requirement applies when posting or editing attachments through the SDK.
-   Missing configuration returns `{:error, {:missing_configuration, :max_file_size}}`;
-   values other than positive integers return
-   `{:error, {:invalid_configuration, :max_file_size}}`. Both fail before upload.
-2. **Update custom transports from `upload_file/3` to `upload_files/3`.** The
-   adapter's public `send_file/3` API remains available, but it now calls the
-   plural transport callback with a one-element list. There is no fallback to
-   the old singular callback. The bundled `Transport.ReqClient` already implements
-   the new contract.
+Configure **independent** positive integer byte limits: `max_file_size` for each
+file and `max_upload_request_size` for the complete encoded HTTP body. Derive the
+latter from your actual server/proxy configuration; the library does not infer it
+from the per-file limit or discover remote settings. Missing request configuration
+fails before HTTP. Text-only operations and publication using already uploaded
+references do not require upload limits. A post accepts at most ten files;
+an excessive selection or any invalid file rejects the complete operation.
 
-For a custom transport, replace `upload_file(channel_id, file, opts)` with
-`upload_files(channel_id, files, opts)`. Each call supplies the files for one post;
-the transport owns request encoding, sizing, and splitting them into HTTP requests
-using `opts[:max_file_size]`. Each input map contains `:body` or `:path`, plus
-`:filename` and `:content_type`. Return `{:ok, %{"file_infos" => infos}}` with one entry per
-input, in request order, each containing a unique server `"id"`. Preserve this
-order even when filenames are duplicated; the adapter uses it to associate
-missing server details with the corresponding upload. Return `{:error, reason}`
-on failure, stopping further requests and returning no partial success. Previously
-uploaded files can remain stored after a later request fails. The post response must confirm a nonempty message ID and all uploaded
-file IDs before the adapter reports successful delivery.
+Custom transports implement `upload_files/3` for one explicit upload request,
+returning ordered `file_infos` with one unique server ID per input. Optional
+`prepare_upload/3` and `upload_prepared/2` provide pure exact encoding and submission
+of the same binary. Preparation accepts materialized bytes, never reads paths,
+and returns the body, content type, byte count, channel ID and input metadata.
+The convenience `upload_files/3` may read paths but never splits a request.
+Uploads and publication return neutral errors, excluding raw response bodies.
+A failed or incomplete response can leave remote effects unconfirmed; hosts own
+reconciliation and decide whether retry is safe.
 
-See [the adapter reference](docs/jido_chat_adapter.md#multiple-file-posts-and-edits)
-for batching and delivery-report behavior.
+Hosts can prepare and upload explicitly, then publish the resulting references:
+
+```elixir
+{:ok, requirements} = Adapter.file_requirements(opts)
+{:ok, prepared} = Adapter.prepare_upload(room, [%{data: bytes, filename: "report.pdf"}], opts)
+{:ok, uploaded} = Adapter.upload_prepared(prepared, opts)
+{:ok, sent} = ChannelRef.post(channel, "Report", uploaded_files: uploaded.files)
+{:ok, updated} = SentMessage.edit(sent, "Updated report", uploaded_files: uploaded.files)
+```
+
+Create/edit validates uploaded references without reuploading. The provider
+response must confirm the requested message and attachment IDs; response order
+controls membership and metadata. Empty `uploaded_files: []` explicitly clears
+attachments on an edit. Omitting it, or passing `files: []`, retains existing
+attachments subject to the server response. Do not save prepared file bodies in
+handles or logs. Delivery reports from old serialized handles are invalidated
+after edits; this provider no longer generates orchestration reports.
+
+The generic SDK wrappers require the SDK revision pinned in `mix.exs` and
+`mix.lock`. Consumers overriding `jido_chat` must retain that contract. See the
+[callback reference](docs/jido_chat_adapter.md#file-operation-contract) and
+[host coverage handoff](docs/delivery-migration.md).
 
 ## Capability Matrix
 
