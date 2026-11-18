@@ -62,33 +62,6 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
     assert is_binary(body)
   end
 
-  @tag timeout: 120_000
-  @tag capture_log: true
-  test "network errors propagate through every HTTP request helper" do
-    # Obtain an OS-assigned local port, then close it to exercise real connection failures.
-    {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1})
-    {:ok, {_, port}} = :inet.sockname(socket)
-    :ok = :gen_tcp.close(socket)
-    unavailable_opts = Keyword.put(opts(), :url, "http://127.0.0.1:#{port}")
-
-    for {callback, args} <- [
-          {:fetch_post, ["p1"]},
-          {:send_message, [@channel_id, "unreachable"]},
-          {:edit_message, [@channel_id, "p1", "unreachable"]},
-          {:delete_message, [@channel_id, "p1"]},
-          {:upload_files, [@channel_id, [%{body: "bytes", filename: "unreachable.txt"}]]},
-          {:upload_files, [@channel_id, [%{body: "one", filename: "one.txt"}, %{body: "two", filename: "two.txt"}]]},
-          {:download_file, [@file_id]}
-        ] do
-      if callback in [:send_message, :edit_message, :upload_files] do
-        assert {:error, :econnrefused} = apply(ReqClient, callback, args ++ [unavailable_opts])
-      else
-        assert {:error, %Req.TransportError{reason: :econnrefused}} =
-                 apply(ReqClient, callback, args ++ [unavailable_opts])
-      end
-    end
-  end
-
   test "application defaults and per-call precedence work in an isolated VM" do
     script = ~S"""
     import ExUnit.Assertions
@@ -156,6 +129,16 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
   test "fetch_channel/2 returns channel metadata" do
     assert {:ok, channel} = ReqClient.fetch_channel(@channel_id, opts())
     assert is_binary(channel["id"])
+  end
+
+  test "team and public-channel discovery include the fixture channel" do
+    assert {:ok, channel} = ReqClient.fetch_channel(@channel_id, opts())
+    team_id = channel["team_id"]
+    assert {:ok, teams} = ReqClient.list_teams(opts())
+    assert Enum.any?(teams, &(&1["id"] == team_id))
+
+    assert {:ok, channels} = ReqClient.list_public_channels(team_id, opts())
+    assert Enum.any?(channels, &(&1["id"] == @channel_id))
   end
 
   test "download_file/2 returns attachment bytes" do
@@ -345,6 +328,44 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
     end
   end
 
+  test "SDK preparation, upload and publication work without request-size configuration" do
+    files = [
+      %{data: "first", filename: "sdk-first.txt", media_type: "text/plain"},
+      %{data: "second", filename: "sdk-second.txt", media_type: "text/plain"}
+    ]
+
+    assert {:ok, %{max_file_size: limit, max_files_per_post: 10, max_upload_request_size: :not_applicable}} =
+             Jido.Chat.Adapter.file_requirements(Adapter, opts())
+
+    assert limit == opts()[:max_file_size]
+    refute Keyword.has_key?(opts(), :max_upload_request_size)
+    assert {:ok, prepared} = Jido.Chat.Adapter.prepare_upload(Adapter, @channel_id, files, opts())
+    assert prepared.size_bytes == byte_size(prepared.body)
+    assert Enum.map(prepared.files, & &1.filename) == ["sdk-first.txt", "sdk-second.txt"]
+
+    assert {:ok, %{files: references}} = Jido.Chat.Adapter.upload_prepared(Adapter, prepared, opts())
+    assert Enum.map(references, & &1.filename) == ["sdk-first.txt", "sdk-second.txt"]
+    ids = Enum.map(references, & &1.id)
+    assert length(Enum.uniq(ids)) == 2
+    assert Enum.all?(ids, &(is_binary(&1) and &1 != ""))
+
+    assert {:ok, response} =
+             Jido.Chat.Adapter.send_message(
+               Adapter,
+               @channel_id,
+               "SDK prepared upload",
+               Keyword.put(opts(), :uploaded_files, references)
+             )
+
+    on_exit(fn -> ReqClient.delete_message(@channel_id, response.external_message_id, opts()) end)
+    assert {:ok, post} = ReqClient.fetch_post(response.external_message_id, opts())
+    assert MapSet.new(post["file_ids"]) == MapSet.new(ids)
+
+    for {id, bytes} <- Enum.zip(ids, ["first", "second"]) do
+      assert {:ok, ^bytes} = ReqClient.download_file(id, opts())
+    end
+  end
+
   @tag :tmp_dir
   test "JPEG, PNG, GIF, WebP, and documents retain file-info MIME and original bytes", %{tmp_dir: tmp_dir} do
     fixtures =
@@ -386,38 +407,4 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientTest do
       assert {:ok, ^bytes} = Adapter.fetch_media(media, opts())
     end
   end
-
-  describe "local connection failures" do
-    @describetag :local_connection
-    @describetag capture_log: true
-
-    setup do
-      # A real refused connection exercises Req's error boundary without HTTP mocks
-      # or a running Mattermost instance.
-      {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1}, active: false)
-      {:ok, port} = :inet.port(socket)
-      :ok = :gen_tcp.close(socket)
-
-      {:ok,
-       opts: [
-         url: "http://127.0.0.1:#{port}",
-         token: System.get_env("MATTERMOST_TOKEN", ""),
-         max_file_size: 1024
-       ]}
-    end
-
-    for operation <- [:upload, :send, :edit] do
-      @operation operation
-
-      test "#{operation} returns a neutral connection failure without policy or retry", %{opts: opts} do
-        assert {:error, :econnrefused} = invoke_refused_connection(@operation, opts)
-      end
-    end
-  end
-
-  defp invoke_refused_connection(:upload, opts),
-    do: ReqClient.upload_files("room", [%{body: "bytes", filename: "file.txt"}], opts)
-
-  defp invoke_refused_connection(:send, opts), do: ReqClient.send_message("room", "Answer", opts)
-  defp invoke_refused_connection(:edit, opts), do: ReqClient.edit_message("room", "post", "Answer", opts)
 end

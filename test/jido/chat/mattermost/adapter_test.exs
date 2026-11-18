@@ -894,6 +894,20 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
   end
 
   describe "fetch_metadata/2" do
+    test "normalizes numeric provider IDs while preserving channel metadata" do
+      channel = %{"id" => 123, "display_name" => "Direct chat", "type" => "D"}
+      Process.put({RecordingTransport, :fetch_channel}, {:ok, channel})
+
+      assert {:ok, %ChannelInfo{} = info} =
+               MattermostAdapter.fetch_metadata("requested-channel", transport: RecordingTransport)
+
+      assert info.id == "123"
+      assert info.name == "Direct chat"
+      assert info.is_dm
+      assert info.metadata == channel
+      assert_received {:transport_call, :fetch_channel, ["requested-channel", _]}
+    end
+
     test "returns normalized channel info" do
       assert {:ok, info} = MattermostAdapter.fetch_metadata("c1", fake_opts())
       assert %ChannelInfo{} = info
@@ -904,6 +918,19 @@ defmodule Jido.Chat.Mattermost.AdapterTest do
   end
 
   describe "open_thread/3" do
+    test "falls back to the requested post ID when the fetched post has no identity" do
+      post = %{"root_id" => "", "message" => "Sparse root post"}
+      Process.put({RecordingTransport, :fetch_post}, {:ok, post})
+
+      assert {:ok, %Thread{} = thread} =
+               MattermostAdapter.open_thread("c1", "requested-post", transport: RecordingTransport)
+
+      assert thread.external_room_id == "c1"
+      assert thread.external_thread_id == "requested-post"
+      assert thread.metadata == %{root_post: post}
+      assert_received {:transport_call, :fetch_post, ["requested-post", _]}
+    end
+
     test "returns a normalized thread rooted at the post id" do
       assert {:ok, thread} = MattermostAdapter.open_thread("c1", "post_abc", fake_opts())
       assert %Thread{} = thread

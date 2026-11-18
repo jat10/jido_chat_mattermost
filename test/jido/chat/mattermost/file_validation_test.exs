@@ -144,6 +144,7 @@ defmodule Jido.Chat.Mattermost.FileValidationTest do
   end
 
   test "requires valid configuration only for nonempty batches" do
+    assert :ok = Adapter.validate_files([])
     assert :ok = Adapter.validate_files([], max_file_size: nil)
 
     assert {:error, {:missing_configuration, :max_file_size}} =

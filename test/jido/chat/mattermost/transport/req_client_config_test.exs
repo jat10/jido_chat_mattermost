@@ -3,6 +3,63 @@ defmodule Jido.Chat.Mattermost.Transport.ReqClientConfigTest do
 
   alias Jido.Chat.Mattermost.Transport.ReqClient
 
+  describe "local connection failures" do
+    @describetag timeout: 120_000
+    @describetag capture_log: true
+
+    setup do
+      # Close an OS-assigned local port to exercise Req's real error boundary.
+      {:ok, socket} = :gen_tcp.listen(0, ip: {127, 0, 0, 1}, active: false)
+      {:ok, port} = :inet.port(socket)
+      :ok = :gen_tcp.close(socket)
+
+      {:ok,
+       opts: [
+         url: "http://127.0.0.1:#{port}",
+         token: System.get_env("MATTERMOST_TOKEN", ""),
+         max_file_size: 1024
+       ]}
+    end
+
+    for {name, callback, args, extra_opts} <- [
+          {"single upload", :upload_files, ["room", [%{body: "bytes", filename: "file.txt"}]], []},
+          {"multiple uploads", :upload_files,
+           ["room", [%{body: "one", filename: "one.txt"}, %{body: "two", filename: "two.txt"}]], []},
+          {"send", :send_message, ["room", "Answer"], [thread_id: "root-post"]},
+          {"edit", :edit_message, ["room", "post", "Answer"], []},
+          {"fetch post", :fetch_post, ["post"], []},
+          {"delete", :delete_message, ["room", "post"], []},
+          {"download", :download_file, ["file"], []},
+          {"fetch posts with limit", :fetch_posts, ["room"], [limit: 5]},
+          {"fetch posts before", :fetch_posts, ["room"], [before: "post"]},
+          {"fetch posts after", :fetch_posts, ["room"], [after: "post"]},
+          {"fetch thread", :fetch_thread, ["post"], []},
+          {"fetch channel", :fetch_channel, ["room"], []},
+          {"get user", :get_user, ["user"], []},
+          {"list teams", :list_teams, [], []},
+          {"list public channels", :list_public_channels, ["team"], []},
+          {"add reaction with user lookup", :add_reaction, ["post", "thumbsup"], []},
+          {"add reaction with supplied user", :add_reaction, ["post", "thumbsup"], [user_id: "user"]},
+          {"remove reaction", :remove_reaction, ["post", "thumbsup", "user"], []},
+          {"typing", :send_typing, ["room"], []},
+          {"open DM", :open_dm_channel, ["bot", "user"], []}
+        ] do
+      @operation callback
+      @args args
+      @extra_opts extra_opts
+
+      test "#{name} preserves the connection failure contract", %{opts: opts} do
+        result = apply(ReqClient, @operation, @args ++ [Keyword.merge(opts, @extra_opts)])
+
+        if @operation in [:send_message, :edit_message, :upload_files] do
+          assert {:error, :econnrefused} = result
+        else
+          assert {:error, %Req.TransportError{reason: :econnrefused}} = result
+        end
+      end
+    end
+  end
+
   test "configuration resolves without an upload-request setting in an isolated VM" do
     script = ~S"""
     import ExUnit.Assertions

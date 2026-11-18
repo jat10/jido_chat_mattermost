@@ -330,6 +330,23 @@ defmodule Jido.Chat.Mattermost.WebSocket.ClientTest do
   # ── handle_in/2 — reaction events ────────────────────────────────────
 
   describe "handle_in/2 reaction events" do
+    test "missing or unset channel configuration rejects reactions without metadata lookups" do
+      for state <- [
+            Map.delete(capturing_sink_state(), :channel_ids),
+            Map.put(capturing_sink_state(), :channel_ids, nil)
+          ],
+          event <- ["reaction_added", "reaction_removed"] do
+        state =
+          state
+          |> Map.put(:auth_status, :pending)
+          |> Map.put(:metadata_opts, transport: ChannelTransport)
+
+        assert {:ok, ^state} = Client.handle_in(reaction_frame(event), state)
+        refute_received {:sink_called, _, _}
+        refute_received {:fetch_channel, _, _}
+      end
+    end
+
     test "dispatches reaction_added as a normalized reaction envelope" do
       frame = reaction_frame("reaction_added")
 
@@ -594,6 +611,29 @@ defmodule Jido.Chat.Mattermost.WebSocket.ClientTest do
   # ── handle_in/2 — channel filtering ──────────────────────────────────
 
   describe "handle_in/2 channel filtering" do
+    test "missing or unset channel configuration dispatches raw posts" do
+      frame = posted_frame(%{"channel_id" => "unlisted-channel"})
+      {:text, json} = frame
+      expected_post = json |> Jason.decode!() |> get_in(["data", "post"]) |> Jason.decode!()
+
+      for state <- [
+            Map.delete(capturing_sink_state(), :channel_ids),
+            Map.put(capturing_sink_state(), :channel_ids, nil)
+          ] do
+        state = Map.put(state, :auth_status, :pending)
+        expected_state = Map.put(state, :auth_status, :ok)
+
+        assert {:ok, ^expected_state} = Client.handle_in(frame, state)
+
+        assert_received {:sink_called,
+                         %{
+                           "post" => ^expected_post,
+                           "channel_type" => nil,
+                           "channel_display_name" => nil
+                         }, [transport: "websocket"]}
+      end
+    end
+
     test "passes through when channel_ids is :all" do
       frame = posted_frame(%{"channel_id" => "any-channel"})
       assert {:ok, _state} = Client.handle_in(frame, raising_sink_state())
